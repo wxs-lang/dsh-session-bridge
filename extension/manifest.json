@@ -1,0 +1,75 @@
+{
+  "manifest_version": 3,
+  "name": "wxs-lang · DSH Browser Bridge",
+  "version": "1.6.0",
+  "description": "让 DSH 在你已登录的浏览器里后台干活：点击、输入、截图、开关标签，全程不抢焦点。",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "alarms",
+    "bookmarks",
+    "contextMenus",
+    "cookies",
+    "debugger",
+    "downloads",
+    "favicon",
+    "history",
+    "nativeMessaging",
+    "notifications",
+    "offscreen",
+    "scripting",
+    "sessions",
+    "sidePanel",
+    "storage",
+    "tabGroups",
+    "tabs",
+    "topSites",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "wxs-lang · DSH Browser Bridge",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "64": "icons/icon64.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "64": "icons/icon64.png",
+    "128": "icons/icon128.png"
+  },
+  "_themeIcons": {
+    "light": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "64": "icons/icon64.png",
+      "128": "icons/icon128.png"
+    },
+    "dark": {
+      "16": "icons/dark/icon16.png",
+      "32": "icons/dark/icon32.png",
+      "48": "icons/dark/icon48.png",
+      "64": "icons/dark/icon64.png",
+      "128": "icons/dark/icon128.png"
+    }
+  },
+  "optional_permissions": [
+    "downloads.open",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

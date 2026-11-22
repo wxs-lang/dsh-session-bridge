@@ -1,0 +1,21 @@
+node_modules/
+*.log
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db
+
+# 本地调试产物
+test/tmp/
+tmp/
+.sandbox/
+probe*.mjs
+standalone.mjs
+
+# 构建/缓存
+dist/
+.cache/
+*.tsbuildinfo
+
+# 图标源素材（第三方素材，不随仓库分发；用 make-icons.py 重新生成需要自备）
+icon-src/

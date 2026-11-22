@@ -1,0 +1,27 @@
+# dsh-browser-bridge — 挂载片段
+#
+# 用法：把下面 `- insert:` 这一块合并进你 DSH profile 里的 cordis.patch.yml。
+#   DSH_HOME 默认是 ~/.dsh，profile 一般在：
+#     $DSH_HOME/profiles/desktop/cordis.patch.yml      （Windows: C:\Users\<你>\.dsh\...）
+#
+# 合并方式二选一：
+#   A. 直接把这几行追加到文件末尾（保持 0 缩进，它是顶层 insert）
+#   B. 如果你的文件已经是列表，去掉最前面的 "- " 只保留 insert 内容
+#
+# 改完重启 DSH 一次。之后改插件代码可以用 browser_reload 热重载，不用再重启。
+#
+# 前置条件：
+#   1. 本包已放进 profile 的 vendor/ 目录（或 npm 安装），能被 name 解析到
+#   2. 浏览器里已加载 extension/ 目录（chrome://extensions → 开发者模式 →
+#      加载已解压的扩展程序）
+#
+# 端口冲突：桥默认监听 127.0.0.1:39401，同时会尝试 39411 / 39421 作为备用口。
+# 若被占用，在 config 里指定 port，并同步改 extension/background.js 的 BRIDGE_PORTS。
+
+- insert:
+    - id: dsh-browser-bridge
+      name: dsh-browser-bridge
+      inject: [ systemPrompt, tools ]
+      config: {}
+      # config 可选字段：
+      #   port: 39401     # 桥的 WS 端口，默认 39401

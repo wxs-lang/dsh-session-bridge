@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>wxs-lang · DSH Bridge</title>
+  <style>
+    :root {
+      --bg: #fff;
+      --fg: #1a1a1a;
+      --dim: #6b7280;
+      --line: #e5e7eb;
+      --accent: #4d6bfe;
+      --ok: #16a34a;
+      --bad: #dc2626;
+      --chip: #f3f4f6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #17181c;
+        --fg: #e6e6e6;
+        --dim: #9ca3af;
+        --line: #2c2e35;
+        --chip: #23252b;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 14px;
+      font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    h1 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+    .sub { color: var(--dim); font-size: 11px; margin-bottom: 12px; }
+    .row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 0; border-top: 1px solid var(--line);
+    }
+    .row:first-of-type { border-top: none; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--dim); }
+    .dot.ok { background: var(--ok); }
+    .dot.bad { background: var(--bad); }
+    .k { color: var(--dim); flex: none; min-width: 62px; }
+    .v { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    button {
+      margin-top: 12px; width: 100%; padding: 7px;
+      border: 1px solid var(--line); border-radius: 7px;
+      background: var(--chip); color: var(--fg);
+      font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    .num { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <h1>wxs-lang</h1>
+  <div class="sub">DSH 浏览器桥 · 后台操控，不抢焦点</div>
+
+  <div class="row"><span class="dot" id="d-bridge"></span><span class="k">桥接状态</span><span class="v" id="v-bridge">检查中…</span></div>
+  <div class="row"><span class="dot" id="d-version"></span><span class="k">版本</span><span class="v num" id="v-version">—</span></div>
+  <div class="row"><span class="dot" id="d-ws"></span><span class="k">监听端口</span><span class="v" id="v-ws">—</span></div>
+  <div class="row"><span class="dot"></span><span class="k">标签页数</span><span class="v num" id="v-tabs">—</span></div>
+  <div class="row"><span class="dot"></span><span class="k">分组情况</span><span class="v num" id="v-groups">—</span></div>
+  <div class="row"><span class="dot"></span><span class="k">调试会话</span><span class="v num" id="v-debug">—</span></div>
+  <div class="row"><span class="dot" id="d-theme"></span><span class="k">图标主题</span><span class="v" id="v-theme">—</span></div>
+
+  <button id="btn-refresh">刷新状态</button>
+  <button id="btn-detach">清理调试会话（去掉角标）</button>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
