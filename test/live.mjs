@@ -61,7 +61,7 @@ if (hostProbe && hostProbe.rpc) {
     console.log(`宿主桥 39401 在跑，但仍是**旧代码**（无 /rpc）—— DSH 还没重启，插件改动未加载。`)
   }
   console.log(`→ 改为本进程起桥（端口 ${FALLBACK_PORT}），用真实插件代码验证扩展链路。`)
-  const mod = await import(new URL('../index.js', import.meta.url).href)
+  const mod = await import(new URL('../impl.js', import.meta.url).href)
   const stub = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     tools: { register: () => () => {} },

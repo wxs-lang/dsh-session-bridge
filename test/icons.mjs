@@ -46,8 +46,8 @@ for (const s of [16, 128]) {
 
 // --- 3) manifest ---
 const mf = JSON.parse(readFileSync(join(EXT, 'manifest.json'), 'utf8'))
-ok(/^1\.[0-9]+\.[0-9]+$/.test(mf.version), 'manifest 版本号合法', mf.version)
-ok(mf.name.includes('wxs-lang'), 'manifest name 含「wxs-lang」', mf.name)
+ok(/^\d+\.\d+\.\d+$/.test(mf.version), 'manifest 版本号合法', mf.version)
+ok(mf.name.includes('大肥鱼'), 'manifest name 含「大肥鱼」', mf.name)
 ok(mf.icons && mf.icons['16'] === 'icons/icon16.png', 'manifest.icons 指向白天图标')
 ok(mf.action.default_icon['128'] === 'icons/icon128.png', 'action.default_icon 正确')
 ok(mf._themeIcons && mf._themeIcons.dark['128'] === 'icons/dark/icon128.png',
@@ -61,13 +61,13 @@ ok(bg.includes("prefers-color-scheme: dark"), '监听 prefers-color-scheme')
 ok(bg.includes('chrome.action.setIcon'), '调用 chrome.action.setIcon')
 ok(/^watchSystemTheme\(\)/m.test(bg), 'watchSystemTheme 在顶层调用（SW 每次唤醒都跑）')
 ok(bg.includes("const dir = dark ? 'icons/dark' : 'icons'"), '图标路径按主题切换')
-ok(/const EXT_VERSION = '1\.[0-9]+\.[0-9]+'/.test(bg), 'EXT_VERSION 已声明')
+ok(/const EXT_VERSION = '\d+\.\d+\.\d+'/.test(bg), 'EXT_VERSION 已声明')
 
 // --- 5) 版本一致性 ---
 ok(mf.version === (bg.match(/const EXT_VERSION = '([^']+)'/) || [])[1], 'manifest 与 background 版本一致', mf.version)
 
 // --- 6) 插件工具层 ---
-const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+const idx = readFileSync(new URL('../impl.js', import.meta.url), 'utf8')
 ok(idx.includes("name: 'browser_theme'"), '插件暴露 browser_theme 工具')
 ok(idx.includes("bridge.request('theme.icon'"), 'browser_theme 转发到 theme.icon')
 

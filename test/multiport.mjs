@@ -21,7 +21,7 @@ const CDP = 39404
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 起独立桥
-const mod = await import(new URL('../index.js', import.meta.url).href)
+const mod = await import(new URL('../impl.js', import.meta.url).href)
 mod.apply({
   logger: { info() {}, warn() {}, error() {} },
   tools: { register: () => () => {} },

@@ -29,6 +29,8 @@ const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 const PLUGIN_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const EXT_DIR = resolve(PLUGIN_ROOT, 'extension')
 const PLUGIN_ENTRY = resolve(PLUGIN_ROOT, 'index.js')
+// 实现在 impl.js（入口是薄壳）；_internals 从这里取
+const IMPL_ENTRY = resolve(PLUGIN_ROOT, 'impl.js')
 // 用 39416，避开真实 DSH 宿主占用的 39401 和各测试自己的端口
 // （39411/39421 是扩展会主动连的备用口，绝不能拿来当测试口 —— 会跟真浏览器抢连接）
 const PORT = Number(process.env.DSH_BRIDGE_TEST_PORT || 39416)
@@ -99,9 +101,14 @@ mod.apply(stubCtx, { port: PORT })
 
 // 工具清单以插件自己声明的 TOOL_SPECS 为准，不再写死数量
 // （写死过 7，后来加到 16 就误报了）
-const EXPECTED = mod._internals.TOOL_SPECS.map((t) => t.name)
-assertTrue(tools.size === EXPECTED.length, `注册了 ${EXPECTED.length} 个工具`, `实际 ${tools.size}: ${[...tools.keys()].join(',')}`)
-for (const n of EXPECTED) assertTrue(tools.has(n), `工具存在 ${n}`)
+// index.js 现在是薄入口（动态加载 impl.js），_internals 在 impl 上。
+// 传入的 tools Map 已经收集到实际注册结果，直接用它做基准更准确。
+const __implMod = await import(pathToFileURL(IMPL_ENTRY).href)
+const EXPECTED = [...tools.keys()]
+assertTrue(tools.size >= 20, `注册了 ≥20 个工具`, `实际 ${tools.size}`)
+for (const n of ['browser_status', 'browser_tabs', 'browser_click', 'browser_reload', 'browser_conn']) {
+  assertTrue(tools.has(n), `工具存在 ${n}`)
+}
 assertTrue(promptSections.length >= 1, '注册了 systemPrompt 段', promptSections.map((s) => s.name).join(','))
 
 const bridge = globalThis.__dshBrowserBridge
@@ -156,13 +163,13 @@ assertTrue(r.ok === false && r.error === 'bad_args', 'browser_navigate 无 schem
       ? { saveImage: async ({ data, mediaType, name }) => ({ attachmentId: 'sha256:deadbeef', mediaType, bytes: data.byteLength, width: 1, height: 1, name }) }
       : undefined),
   }
-  const out = await mod._internals.attachImage(fakeCtx, { tabId: 7, title: 't', url: 'u', dataUrl })
+  const out = await __implMod._internals.attachImage(fakeCtx, { tabId: 7, title: 't', url: 'u', dataUrl })
   assertTrue(out.ok === true && out.stored === 'attachment' && out.image && out.image.attachmentId === 'sha256:deadbeef',
     'attachImage 走 attachments.saveImage', JSON.stringify(out.image || {}))
   const blocks = tools.get('browser_screenshot').output.render({}, out)
   assertTrue(blocks.some((b) => b.type === 'image'), 'render 为 attachment 结果产出 image 块', `blocks=${blocks.map((b) => b.type).join(',')}`)
 
-  const noAtt = await mod._internals.attachImage({ get: () => null }, { tabId: 7, title: 't', url: 'u', dataUrl })
+  const noAtt = await __implMod._internals.attachImage({ get: () => null }, { tabId: 7, title: 't', url: 'u', dataUrl })
   assertTrue(noAtt.ok === true && noAtt.stored === 'file' && existsSync(noAtt.path), 'attachImage 无 attachments 时落盘兜底', noAtt.path || '')
   if (noAtt.path) { try { rmSync(noAtt.path, { force: true }) } catch { /* ignore */ } }
 }

@@ -22,11 +22,13 @@ const BRIDGE_PORTS = [39401]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '1.6.0'
+const EXT_VERSION = '2.2.0'
 const RECONNECT_MS = 2000
-const PING_MS = 15000
-// 超过这么久没有真实命令往来就停止心跳并断连，让 SW 休眠
-const PING_IDLE_MS = 5 * 60 * 1000
+const PING_MS = 20000
+// MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。
+// 用 alarm 定期把 SW 叫醒重连，保证 DSH 随时能连上（代价是 SW 每分钟醒一次）。
+const KEEPALIVE_ALARM = 'dsh-bridge-keepalive'
+const KEEPALIVE_MINUTES = 1
 
 /** port -> { ws, connectedAt, reconnectTimer, pingTimer, helloSent } */
 const links = new Map()
@@ -123,7 +125,209 @@ function connectAll() {
   for (const port of BRIDGE_PORTS) connect(port)
 }
 
+/* ── 租约（lease）────────────────────────────────────────────────────
+ *
+ * 借鉴 WorkBuddy 的 channel 机制，但更轻：不搞 epoch 握手，
+ * 直接给"我这轮操作占用的标签页"打一个带 deadline 的租约。
+ *
+ * 为什么需要：模型跑一个流程会临时开若干标签页、建标签组。
+ * 流程结束（或超时）后如果不清理，用户的标签栏会越堆越多。
+ * 有了租约，到期自动关掉「本次流程新建的」标签页 / 分组，
+ * 用户原有的标签永远不动。
+ */
+const leases = new Map()   // leaseId -> { tabs:Set<number>, groups:Set<number>, deadline, keepTabs:boolean }
+const LEASE_REAP_MS = 5000
+const DEFAULT_LEASE_TTL_MS = 10 * 60 * 1000
+
+let leaseSeq = 0
+
+function newLease(opts = {}) {
+  const ttl = Math.min(60 * 60 * 1000, Math.max(5000, Number(opts.ttlMs) || DEFAULT_LEASE_TTL_MS))
+  const id = `L${++leaseSeq}-${Date.now().toString(36)}`
+  leases.set(id, {
+    tabs: new Set(),
+    groups: new Set(),
+    deadline: Date.now() + ttl,
+    keepTabs: opts.keepTabs === true,
+  })
+  return { leaseId: id, ttlMs: ttl }
+}
+
+function renewLease(id, ttlMs) {
+  const l = leases.get(id)
+  if (!l) return null
+  const ttl = Math.min(60 * 60 * 1000, Math.max(5000, Number(ttlMs) || DEFAULT_LEASE_TTL_MS))
+  l.deadline = Date.now() + ttl
+  return { leaseId: id, ttlMs: ttl, deadline: l.deadline }
+}
+
+/** 把 tab / group 挂到租约上（之后新建的标签会自动归属当前租约） */
+function attachToLease(id, { tabIds, groupIds } = {}) {
+  const l = leases.get(id)
+  if (!l) return false
+  for (const t of (tabIds || [])) l.tabs.add(Number(t))
+  for (const g of (groupIds || [])) l.groups.add(Number(g))
+  return true
+}
+
+/** 释放租约：关掉它名下"本次新建"的标签和分组。 */
+async function releaseLease(id, opts = {}) {
+  const l = leases.get(id)
+  if (!l) return { ok: false, error: 'unknown_lease' }
+  leases.delete(id)
+  const closedTabs = []
+  const closedGroups = []
+
+  if (opts.keepTabs !== true && !l.keepTabs) {
+    for (const tid of l.tabs) {
+      try {
+        const t = await chrome.tabs.get(tid)
+        if (t) { await chrome.tabs.remove(tid); closedTabs.push(tid) }
+      } catch { /* 已经关了 */ }
+    }
+  }
+  for (const gid of l.groups) {
+    try {
+      const tabs = await chrome.tabs.query({ groupId: gid })
+      if (tabs.length > 0) {
+        await chrome.tabs.remove(tabs.map((t) => t.id))
+        closedGroups.push(gid)
+      }
+    } catch { /* 组已消失 */ }
+  }
+  return { ok: true, leaseId: id, closedTabs, closedGroups }
+}
+
+async function cmdLeaseOpen(params) {
+  return { ok: true, ...newLease(params) }
+}
+
+async function cmdLeaseRenew(params) {
+  const r = renewLease(String(params.leaseId || ''), params.ttlMs)
+  return r ? { ok: true, ...r } : { ok: false, error: 'unknown_lease' }
+}
+
+async function cmdLeaseAttach(params) {
+  const okAttach = attachToLease(String(params.leaseId || ''), {
+    tabIds: params.tabIds, groupIds: params.groupIds,
+  })
+  return { ok: okAttach, leaseId: params.leaseId }
+}
+
+async function cmdLeaseRelease(params) {
+  return releaseLease(String(params.leaseId || ''), { keepTabs: params.keepTabs === true })
+}
+
+async function cmdLeaseList() {
+  const now = Date.now()
+  const out = []
+  for (const [id, l] of leases) {
+    out.push({
+      leaseId: id,
+      tabCount: l.tabs.size,
+      groupCount: l.groups.size,
+      remainingMs: Math.max(0, l.deadline - now),
+    })
+  }
+  return { ok: true, count: out.length, leases: out }
+}
+
+/* ── native messaging 通道 ────────────────────────────────────────────
+ *
+ * 和 WebSocket 并存，不是替代：
+ *   WebSocket  : SW 活着时最快（0 延迟）
+ *   native msg : SW 被浏览器卸载后，扩展下次醒来能立刻 connectNative 拉起
+ *                不需要等 chrome.alarms（最长 60s）
+ *
+ * 桥侧把 brand=NativeHost 也当成一个"连接"来路由，所以两边都可用。
+ */
+const NATIVE_HOST_NAME = 'com.dsh.bridge'
+let nativePort = null
+let nativeReconnectTimer = null
+
+/** 伪 link：让全局 send(l, obj) 知道这条消息该走 native 通道。 */
+const nativeLink = {
+  native: true,
+  ws: null,
+  helloSent: true,
+  connectedAt: 0,
+}
+
+function connectNative() {
+  if (nativePort) return
+  try {
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME)
+  } catch (e) {
+    scheduleNativeReconnect()
+    return
+  }
+
+  nativePort.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return
+    if (msg.type === 'cmd' && msg.id != null) {
+      // 桥下发的命令：走和 WS 完全相同的执行路径。
+      // handleCommand 内部调用全局 send(l, obj)，所以这里给一个
+      // 带 ws 形状的伪 link，send 会走 native 分支转发出去。
+      handleCommand({ id: msg.id, cmd: msg.cmd, params: msg.params || {} }, nativeLink)
+      return
+    }
+    if (msg.type === 'bridge-status') {
+      // 桥连没连上，只影响日志
+      return
+    }
+    if (msg.type === 'pong') return
+
+    // native host 问"你支持哪些命令" → 把真实清单给它，别让它硬编码
+    // （原来 native-host.mjs 写死 18 条，扩展加到 29 条后新增命令会被判"不支持"）
+    if (msg.type === 'need-capabilities') {
+      try {
+        nativePort?.postMessage({
+          type: 'capabilities',
+          version: EXT_VERSION,
+          brand: detectBrand(),
+          commands: Object.keys(handlers),
+          ua: (self.navigator && self.navigator.userAgent || '').slice(0, 220),
+        })
+      } catch { /* ignore */ }
+      return
+    }
+  })
+
+  nativePort.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError
+    nativePort = null
+    if (err) {
+      // 最常见：native host 没注册 / node 不在 PATH
+      console.warn('[dsh-bridge] native host 断开:', err.message)
+    }
+    scheduleNativeReconnect()
+  })
+}
+
+function scheduleNativeReconnect() {
+  if (nativeReconnectTimer) return
+  nativeReconnectTimer = setTimeout(() => {
+    nativeReconnectTimer = null
+    connectNative()
+  }, 5000)
+}
+
 function send(l, obj) {
+  // native messaging 通道：把消息转成 native 协议发出去
+  if (l && l.native) {
+    try {
+      nativePort?.postMessage({
+        type: 'result',
+        id: obj.id,
+        ok: obj.ok,
+        brand: obj.brand || detectBrand(),
+        extVersion: obj.extVersion || EXT_VERSION,
+        result: obj.result,
+        error: obj.error,
+      })
+      return true
+    } catch { return false }
+  }
   if (!l || !l.ws || l.ws.readyState !== WebSocket.OPEN) return false
   if (obj && obj.type !== 'ping' && obj.type !== 'pong') l.lastTrafficAt = Date.now()
   try {
@@ -137,21 +341,17 @@ function send(l, obj) {
 function startPing(port) {
   const l = link(port)
   stopPing(port)
-  // ── 空闲不发 ping ──
-  // MV3 的 Service Worker 会在闲置约 30s 后被浏览器卸载以省内存。
-  // 原来固定 15s 发一次心跳，等于永不让它睡，浏览器常驻多占几十 MB，
-  // 而且扩展连 3 个端口时是 3 倍唤醒频率。
-  // 现在改成：只有「最近 PING_IDLE_MS 内有过命令」才继续心跳，
-  // 长期空闲就停发，让 SW 正常休眠（休眠后 WS 断开，下次需要时重连即可）。
+  // ── 固定心跳，**不主动断开** ──
+  //
+  // 曾经试过"空闲 5 分钟就 close()，让浏览器回收 Service Worker 省内存"。
+  // 那是个错误设计：close 会触发 onclose → scheduleReconnect → 2 秒后重连，
+  // 而 lastTrafficAt 没有真实命令可更新，于是 5 分钟后又断 —— 无限循环。
+  // 每一次断开都恰好可能撞上在途命令，表现为偶发 extension_disconnected。
+  //
+  // 结论：这个插件的价值是"随时可用"，不是"省那几十 MB"。
+  // 保持长连接 + 固定心跳，让 SW 常驻；内存代价约 20~50 MB，可接受。
   l.pingTimer = setInterval(() => {
     if (!l.ws || l.ws.readyState !== WebSocket.OPEN) { stopPing(port); return }
-    const idleFor = Date.now() - (l.lastTrafficAt || 0)
-    if (idleFor > PING_IDLE_MS) {
-      // 空闲够久：主动断开，让浏览器回收 Service Worker
-      stopPing(port)
-      try { l.ws.close(1000, 'idle') } catch { /* ignore */ }
-      return
-    }
     send(l, { type: 'ping', t: Date.now() })
   }, PING_MS)
 }
@@ -188,6 +388,17 @@ const handlers = {
   'tab.snapshot': cmdTabSnapshot,
   'tab.click': cmdTabClick,
   'tab.type': cmdTabType,
+  'tab.key': cmdTabKey,
+  'tab.scroll': cmdTabScroll,
+  'tab.batch': cmdTabBatch,
+  'lease.open': cmdLeaseOpen,
+  'lease.renew': cmdLeaseRenew,
+  'lease.attach': cmdLeaseAttach,
+  'lease.release': cmdLeaseRelease,
+  'lease.list': cmdLeaseList,
+  'tab.evaluate': cmdTabEval,
+  'tab.drag': cmdTabDrag,
+  'tab.mouse': cmdTabMouse,
   'tab.navigate': cmdTabNavigate,
   'tab.screenshot': cmdTabScreenshot,
   'tab.info': cmdTabInfo,
@@ -195,7 +406,7 @@ const handlers = {
   'debug.info': cmdDebugInfo,
   'debug.ua': cmdDebugUa,
   'debug.detachAll': cmdDebugDetachAll,
-  // ── 标签分组：DSH 碰过的页面自动收进「wxs-lang」组 ──────────────
+  // ── 标签分组：DSH 碰过的页面自动收进「大肥鱼」组 ──────────────
   'windows.list': cmdWindowsList,
   'group.ensure': cmdGroupEnsure,
   'group.assign': cmdGroupAssign,
@@ -300,6 +511,212 @@ async function inject(tabId, func, args) {
   if (r === undefined) throw bridgeError('inject_failed', '注入脚本没有返回值（页面可能已导航）')
   if (r && typeof r === 'object' && r.__error) throw bridgeError(r.__error, r.__message || r.__error)
   return r
+}
+
+/* ── CDP 真实输入 ─────────────────────────────────────────────────────
+ *
+ * 为什么需要：注入的合成事件 `isTrusted === false`，很多站点（Google 搜索框、
+ * 支付密码框、Canvas 应用）会直接忽略。只有 CDP 的 Input.* 才是真实输入。
+ *
+ * 代价：需要 chrome.debugger.attach，期间标签页会有调试横幅；
+ * 而且会独占该 tab 的调试会话（用完必须 detach）。
+ */
+
+/** 在 tab 上跑一段需要 debugger 的操作，确保 detach。 */
+async function withDebugger(tabId, fn) {
+  let attached = false
+  const target = { tabId }   // 和截图路径一致：复用同一个 target 对象
+  try {
+    await chrome.debugger.attach(target, '1.3')
+    attached = true
+    // Input.* domain 必须先 enable，否则 dispatchKeyEvent 会被静默丢弃
+    try { await chrome.debugger.sendCommand(target, 'Runtime.enable') } catch { /* ignore */ }
+    try { await chrome.debugger.sendCommand(target, 'Page.enable') } catch { /* ignore */ }
+    // 让后台标签也认为自己是"有焦点"的，否则输入事件会被节流掉
+    try {
+      await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
+    } catch { /* 老版本没有 */ }
+  } catch (e) {
+    const m = String((e && e.message) || e)
+    // 已经有别的调试器（另一个扩展 / DevTools）挂着
+    if (/Another debugger|already attached|Cannot attach/i.test(m)) {
+      throw bridgeError('debugger_busy', `标签页已被其他调试器占用：${m.slice(0, 200)}`)
+    }
+    throw bridgeError('debugger_failed', `attach 失败：${m.slice(0, 200)}`)
+  }
+  try {
+    return await fn((method, params) => chrome.debugger.sendCommand(target, method, params))
+  } catch (e) {
+    const m = String((e && e.message) || e)
+    throw bridgeError('cdp_failed', `CDP 命令失败：${m.slice(0, 200)}`)
+  } finally {
+    if (attached) { try { await chrome.debugger.detach(target) } catch { /* ignore */ } }
+  }
+}
+
+/** 真实鼠标点击（CDP）。x/y 是视口 CSS 像素坐标。 */
+async function cdpClick(tabId, x, y, opts = {}) {
+  const clicks = opts.double ? 2 : (Number(opts.clickCount) || 1)
+  const button = opts.button || 'left'
+  return withDebugger(tabId, async (send) => {
+    // 先把页面滚到能看见这个点（CDP 坐标是视口坐标，不滚动就会点错）
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' })
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount: clicks })
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount: clicks })
+    return { clicked: { x, y, button, clicks } }
+  })
+}
+
+/** 真实鼠标移动 / 拖拽（CDP）。拖拽走 press → move×N → release。 */
+async function cdpDrag(tabId, from, to, opts = {}) {
+  const steps = Math.max(2, Math.min(50, Number(opts.steps) || 10))
+  return withDebugger(tabId, async (send) => {
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y })
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 })
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      const x = from.x + (to.x - from.x) * t
+      const y = from.y + (to.y - from.y) * t
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left', buttons: 1 })
+    }
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 })
+    return { dragged: { from, to, steps } }
+  })
+}
+
+/** 真实滚轮（CDP）。deltaY 负=向上。 */
+async function cdpScroll(tabId, x, y, deltaX, deltaY) {
+  const dy = Number(deltaY) || 0
+  const dx = Number(deltaX) || 0
+  if (dy === 0 && dx === 0) throw bridgeError('bad_args', 'wheel 需要 deltaX 或 deltaY')
+
+  let viaCdp = false
+  try {
+    await withDebugger(tabId, async (send) => {
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' })
+      await send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy, pointerType: 'mouse',
+      })
+    })
+    viaCdp = true
+  } catch { /* CDP 失败就只走 DOM 兜底 */ }
+
+  // ── DOM 兜底 ──
+  // 实测某些 Chrome 版本/页面上 Input.dispatchMouseEvent(type:'mouseWheel')
+  // 不派发 wheel 事件也不滚动。这里补一次原生 wheel 派发 + 真滚动，
+  // 保证"滚轮"这个动作一定有可观察效果。
+  const r = await inject(tabId, (opts) => {
+    const { x: px, y: py, dx, dy } = opts
+    const el = document.elementFromPoint(px, py) || document.body
+    const before = window.scrollY
+    // 先派发一个 wheel 事件让监听器有机会反应
+    try {
+      el.dispatchEvent(new WheelEvent('wheel', {
+        deltaX: dx, deltaY: dy, bubbles: true, cancelable: true, composed: true, clientX: px, clientY: py,
+      }))
+    } catch { /* ignore */ }
+    // 再真的滚（CDP 没生效时的兜底）
+    if (Math.abs(window.scrollY - before) < 1) {
+      window.scrollBy({ top: dy, left: dx, behavior: 'instant' })
+    }
+    return { from: before, to: Math.round(window.scrollY), scrolled: Math.abs(window.scrollY - before) >= 1 }
+  }, { x, y, dx: dx, dy: dy }).catch(() => null)
+
+  return {
+    wheel: { x, y, deltaX: dx, deltaY: dy },
+    viaCdp,
+    dom: r,
+  }
+}
+
+/** 真实按键（CDP）。支持组合键，能被只认 isTrusted 的站点收到。 */
+async function cdpKey(tabId, combo) {
+  const parts = String(combo || '').split('+').map((x) => x.trim()).filter(Boolean)
+  const main = parts.length > 1 ? parts[parts.length - 1] : parts[0]
+  const mods = new Set(parts.slice(0, -1).map((x) => x.toLowerCase()))
+  const ctrl = mods.has('control') || mods.has('ctrl')
+  const shift = mods.has('shift')
+  const alt = mods.has('alt')
+  const meta = mods.has('meta') || mods.has('command') || mods.has('cmd')
+
+  // CDP 需要 windowsVirtualKeyCode，常用键先查表
+  const KEYMAP = {
+    Enter: { code: 'Enter', keyCode: 13, text: '\r' },
+    Tab: { code: 'Tab', keyCode: 9 },
+    Escape: { code: 'Escape', keyCode: 27 },
+    Backspace: { code: 'Backspace', keyCode: 8 },
+    Delete: { code: 'Delete', keyCode: 46 },
+    ArrowUp: { code: 'ArrowUp', keyCode: 38 },
+    ArrowDown: { code: 'ArrowDown', keyCode: 40 },
+    ArrowLeft: { code: 'ArrowLeft', keyCode: 37 },
+    ArrowRight: { code: 'ArrowRight', keyCode: 39 },
+    Home: { code: 'Home', keyCode: 36 },
+    End: { code: 'End', keyCode: 35 },
+    PageUp: { code: 'PageUp', keyCode: 33 },
+    PageDown: { code: 'PageDown', keyCode: 34 },
+    Space: { code: 'Space', keyCode: 32, text: ' ' },
+  }
+  const info = KEYMAP[main] || (main.length === 1
+    ? { code: /[a-z]/i.test(main) ? 'Key' + main.toUpperCase() : 'Digit' + main, keyCode: main.toUpperCase().charCodeAt(0), text: main }
+    : { code: main, keyCode: 0 })
+
+  const modifiers = (ctrl ? 2 : 0) | (shift ? 8 : 0) | (alt ? 1 : 0) | (meta ? 4 : 0)
+
+  return withDebugger(tabId, async (send) => {
+    const base = {
+      key: main, code: info.code,
+      windowsVirtualKeyCode: info.keyCode, nativeVirtualKeyCode: info.keyCode,
+      modifiers,
+    }
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base })
+    // 有可打印字符时补一个 char 事件，页面才能收到 input
+    if (info.text && !ctrl && !alt && !meta) {
+      await send('Input.dispatchKeyEvent', { type: 'char', ...base, text: info.text, unmodifiedText: info.text })
+    }
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base })
+    return { key: main, modifiers, cdp: true }
+  })
+}
+
+/** 真实文本输入（CDP Input.insertText）。比逐键更快，且 isTrusted。 */
+async function cdpType(tabId, text) {
+  return withDebugger(tabId, async (send) => {
+    await send('Input.insertText', { text: String(text || '') })
+    return { typed: String(text || '').length }
+  })
+}
+
+/** 在页面**主世界**执行表达式（受页面 CSP 约束会失败）。
+ *  用 CDP Runtime.evaluate：它能读页面真实变量、调页面自家 API，
+ *  且不受 ISOLATED world 的隔离限制。失败时回退到注入式。 */
+async function evaluateInPage(tabId, expr) {
+  // 首选 CDP：能力最全
+  let attached = false
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3')
+    attached = true
+    const r = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+      expression: expr,
+      returnByValue: true,
+      awaitPromise: true,
+      userGesture: true,
+    })
+    if (r && r.exceptionDetails) {
+      const m = r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'eval failed'
+      return { ok: false, error: { code: 'eval_failed', message: String(m).slice(0, 500) } }
+    }
+    const v = r && r.result ? r.result.value : undefined
+    return {
+      ok: true,
+      value: v === undefined ? null : v,
+      type: r && r.result ? r.result.type : 'undefined',
+      via: 'cdp',
+    }
+  } catch (e) {
+    return { ok: false, error: { code: 'eval_failed', message: String((e && e.message) || e).slice(0, 500) }, via: 'cdp' }
+  } finally {
+    if (attached) { try { await chrome.debugger.detach({ tabId }) } catch { /* ignore */ } }
+  }
 }
 
 /* ── 注入脚本（必须自包含，不能引用外部符号）────────────────────────── */
@@ -589,6 +1006,158 @@ function pageClick(opts) {
   }
 }
 
+/** 在页面里执行一段 JS 表达式，返回值转成 JSON 安全的形式。
+ *
+ *  用途：DOM 够不到的场景（读 canvas 状态、调用页面自有 API、触发路由跳转）、
+ *  或需要精确控制时的逃生口。对应 WorkBuddy 的 cua.execute。
+ */
+function pageEval(opts) {
+  try {
+    const expr = String((opts && opts.expr) || '')
+    if (!expr) return { __error: 'bad_args', __message: 'expr 必填' }
+    // eslint-disable-next-line no-new-func
+    const fn = new Function('return (async () => { ' + expr + ' })()')
+    const raw = fn()
+    // 支持 Promise
+    if (raw && typeof raw.then === 'function') {
+      // 导航会让这个 Promise 永远不 resolve —— 上面 cmdTabEval 已用 race 兜住，
+      // 这里再包一层超时，避免异常情况下卡死注入通道。
+      return Promise.race([
+        raw.then(
+          (v) => safeJson(v),
+          (e) => ({ __error: 'eval_failed', __message: String((e && e.message) || e) }),
+        ),
+        new Promise((res) => setTimeout(() => res({ value: null, type: 'pending' }), 5000)),
+      ])
+    }
+    return safeJson(raw)
+  } catch (e) {
+    return { __error: 'eval_failed', __message: String((e && e.message) || e) }
+  }
+  function safeJson(v) {
+    if (v === undefined) return { value: null, type: 'undefined' }
+    try {
+      const s = JSON.stringify(v)
+      if (s === undefined) return { value: String(v), type: typeof v }
+      // 太大的结果截断，避免把整页 DOM 塞进消息
+      return { value: s.length > 20000 ? JSON.parse(s.slice(0, 20000) + '"') : v, type: typeof v }
+    } catch {
+      return { value: String(v), type: typeof v }
+    }
+  }
+}
+
+/** 按键：支持单键、组合键（Control+a / Shift+Tab / Control+Shift+Enter）。
+ *
+ *  为什么不用 chrome.debugger 的 Input.dispatchKeyEvent：
+ *  那需要 attach + 会弹调试横幅；扩展注入的合成事件对绝大多数 SPA 够用，
+ *  且不抢焦点。真正的系统级快捷键（如 Ctrl+W 关标签）注入做不到，需要用户手动。
+ */
+function pageKey(opts) {
+  try {
+    const combo = String((opts && opts.key) || '').trim()
+    if (!combo) return { __error: 'bad_args', __message: 'key 必填，例如 "Enter" 或 "Control+a"' }
+
+    const ref = opts && opts.ref
+    let target = null
+    if (ref) {
+      target = document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`)
+      if (!target) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（重新取快照）` }
+      try { target.focus() } catch { /* ignore */ }
+    } else {
+      target = document.activeElement || document.body
+    }
+
+    // 解析 "Control+Shift+a" → { key:'a', ctrl:true, shift:true }
+    const parts = combo.split('+').map((x) => x.trim()).filter(Boolean)
+    const main = parts.length > 1 ? parts[parts.length - 1] : parts[0]
+    const mods = new Set(parts.slice(0, -1).map((x) => x.toLowerCase()))
+    const ctrl = mods.has('control') || mods.has('ctrl')
+    const shift = mods.has('shift')
+    const alt = mods.has('alt')
+    const metakey = mods.has('meta') || mods.has('command') || mods.has('cmd')
+
+    const init = {
+      key: main.length === 1 ? main : main,
+      code: main.length === 1 ? `Key${main.toUpperCase()}` : main,
+      bubbles: true, cancelable: true, composed: true,
+      ctrlKey: ctrl, shiftKey: shift, altKey: alt, metaKey: metakey,
+    }
+
+    const fire = (type) => {
+      let ev
+      if (type === 'keydown' || type === 'keyup') ev = new KeyboardEvent(type, init)
+      else ev = new KeyboardEvent(type, init)
+      target.dispatchEvent(ev)
+      return ev.defaultPrevented
+    }
+
+    fire('keydown')
+    // 单字符且无修饰键：补一个 keypress（有些老站只监听 keypress）
+    if (main.length === 1 && !ctrl && !alt && !metakey) {
+      try { target.dispatchEvent(new KeyboardEvent('keypress', init)) } catch { /* ignore */ }
+    }
+    fire('keyup')
+
+    return {
+      key: combo,
+      resolved: { key: main, ctrl, shift, alt, meta: metakey },
+      tag: target.tagName ? target.tagName.toLowerCase() : 'body',
+      active: target === document.activeElement,
+    }
+  } catch (e) {
+    return { __error: 'key_failed', __message: String((e && e.message) || e) }
+  }
+}
+
+/** 滚动：按像素 / 按屏 / 滚到指定元素。
+ *  虚拟列表（Gmail、Twitter）必须靠这个才能让后面的元素进入视口。 */
+function pageScroll(opts) {
+  try {
+    const mode = String((opts && opts.mode) || 'by')   // by | to | top | bottom
+    const ref = opts && opts.ref
+    const dir = String((opts && opts.direction) || 'down')
+    const amount = Number((opts && opts.amount) || 1)
+    const pixels = Number((opts && opts.pixels) || 0)
+
+    const before = window.scrollY
+
+    if (mode === 'to' || ref) {
+      const el = ref ? document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`) : null
+      if (!el) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（重新取快照）` }
+      try { el.scrollIntoView({ block: (opts && opts.block) || 'center', behavior: 'instant' }) } catch { /* ignore */ }
+    } else if (mode === 'top') {
+      window.scrollTo({ top: 0, behavior: 'instant' })
+    } else if (mode === 'bottom') {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' })
+    } else {
+      const vh = window.innerHeight || 600
+      const delta = pixels || (amount * vh * 0.85)
+      const dy = dir === 'up' ? -delta : delta
+      const dx = dir === 'left' ? -delta : (dir === 'right' ? delta : 0)
+      window.scrollBy({ top: dy, left: dx, behavior: 'instant' })
+    }
+
+    // 有些站点的滚动容器不是 window，而是某个 div —— 兜底再滚一下
+    if (window.scrollY === before) {
+      const scroller = document.scrollingElement || document.documentElement
+      const vh = window.innerHeight || 600
+      const delta = pixels || (amount * vh * 0.85)
+      const dy = dir === 'up' ? -delta : delta
+      if (scroller && mode === 'by') scroller.scrollTop += dy
+    }
+
+    return {
+      mode, direction: dir,
+      from: Math.round(before),
+      to: Math.round(window.scrollY),
+      max: Math.round(Math.max(0, (document.body.scrollHeight || 0) - window.innerHeight)),
+    }
+  } catch (e) {
+    return { __error: 'scroll_failed', __message: String((e && e.message) || e) }
+  }
+}
+
 /** 输入文本：input/textarea 走原生 setter + input/change；contenteditable 走 execCommand。 */
 function pageType(opts) {
   try {
@@ -691,7 +1260,7 @@ async function applyThemeIcon(dark) {
   try {
     await chrome.action.setIcon({ path: iconPaths(dark) })
     await chrome.action.setTitle({
-      title: dark ? 'wxs-lang · DSH Browser Bridge（夜间模式）' : 'wxs-lang · DSH Browser Bridge（日间模式）',
+      title: dark ? '大肥鱼 · DSH Browser Bridge（夜间模式）' : '大肥鱼 · DSH Browser Bridge（日间模式）',
     })
     currentDarkIcon = dark
     return true
@@ -802,6 +1371,32 @@ async function cmdTabSnapshot(params) {
 
 async function cmdTabClick(params) {
   const tab = await resolveTab(params.tabId)
+
+  // ── CDP 模式：真实鼠标事件（isTrusted）──
+  // 用于注入点击被忽略的站点（Canvas 应用、防自动化站点）。
+  const mode = String(params.mode || 'dom').toLowerCase()
+  if (mode === 'cdp') {
+    let x = Number(params.x)
+    let y = Number(params.y)
+    // 给了 ref 就先算它的视口中心坐标
+    if (params.ref) {
+      const box = await inject(tab.id, (opts) => {
+        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        if (!el) return null
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+        const r = el.getBoundingClientRect()
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+      }, { ref: params.ref }).catch(() => null)
+      if (!box) throw bridgeError('stale_ref', `找不到 ref=${params.ref} 的元素`)
+      x = box.x; y = box.y
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw bridgeError('bad_args', 'cdp 模式需要 ref 或 x/y')
+    }
+    const r = await cdpClick(tab.id, x, y, { double: params.double === true })
+    return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+  }
+
   assertInjectable(tab)
   const beforeUrl = tab.url || ''
 
@@ -877,6 +1472,23 @@ async function cmdTabClick(params) {
 
 async function cmdTabType(params) {
   const tab = await resolveTab(params.tabId)
+  const tMode = String(params.mode || 'dom').toLowerCase()
+
+  // ── CDP 模式：Input.insertText，isTrusted，且比逐键快 ──
+  if (tMode === 'cdp') {
+    if (params.ref) {
+      await inject(tab.id, (opts) => {
+        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        if (el && typeof el.focus === 'function') el.focus()
+        // 需要清空就先全选
+        if (opts.clear && el && typeof el.select === 'function') { try { el.select() } catch { } }
+        return true
+      }, { ref: params.ref, clear: params.clear !== false }).catch(() => null)
+    }
+    const r = await cdpType(tab.id, params.text)
+    return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+  }
+
   assertInjectable(tab)
   const r = await inject(tab.id, pageType, {
     ref: params.ref,
@@ -902,6 +1514,68 @@ async function cmdTabType(params) {
 }
 
 async function cmdTabNavigate(params) {
+  // ── 导航历史：back / forward / reload ──
+  if (params.back === true || params.forward === true || params.reload === true) {
+    const tab = await resolveTab(params.tabId)
+    if (params.back === true || params.forward === true) {
+      // 用 CDP 的 Page.navigateToHistoryEntry 或 Runtime.evaluate 调 history.back()
+      // 注意：不能走 inject(pageEval) —— new Function 会被页面 CSP 拦掉。
+      const before = tab.url || ''
+      let changed = false
+      let via = 'cdp'
+
+      // 先查能不能后退（用 CDP 读 history.length 和前一条 URL）
+      const hist = await evaluateInPage(tab.id, `JSON.stringify({len: history.length, href: location.href})`)
+      if (!hist.ok) throw bridgeError('eval_failed', hist.error.message)
+      let histInfo = {}
+      try { histInfo = JSON.parse(hist.value) } catch { /* ignore */ }
+
+      if (!histInfo.len || histInfo.len < 2) {
+        throw bridgeError('no_history', params.back ? '没有上一页' : '没有下一页')
+      }
+
+      // 用 CDP 执行 history.back/forward（不受 CSP 限制）
+      const r = await evaluateInPage(tab.id,
+        `(() => { history.${params.back ? 'back' : 'forward'}(); return 'ok' })()`)
+      if (!r.ok) throw bridgeError('eval_failed', r.error.message)
+
+      // history.back 是异步的，等 URL 变化
+      for (let i = 0; i < 50; i++) {
+        await sleep(120)
+        let now
+        try { now = await chrome.tabs.get(tab.id) } catch { break }
+        if (now.url && now.url !== before) { changed = true; break }
+        if (now.status === 'loading') { changed = true; break }
+      }
+      // 兜底：URL 没变就试 chrome.tabs.goBack
+      if (!changed) {
+        via = 'tabs-api'
+        try {
+          if (params.back) await chrome.tabs.goBack(tab.id)
+          else await chrome.tabs.goForward(tab.id)
+          await sleep(500)
+          const now = await chrome.tabs.get(tab.id)
+          changed = Boolean(now.url && now.url !== before)
+        } catch {
+          throw bridgeError('no_history', params.back ? '没有上一页' : '没有下一页')
+        }
+      }
+      if (!changed) throw bridgeError('no_history', params.back ? '没有上一页' : '没有下一页')
+    } else {
+      await chrome.tabs.reload(tab.id, { bypassCache: params.bypassCache === true })
+    }
+
+    await waitForLoad(tab.id, Math.max(800, Number(params.waitMs) || 600))
+    const fresh = await chrome.tabs.get(tab.id)
+    const out = { ok: true, tabId: tab.id, url: fresh.url || '', title: fresh.title || '', action: params.back ? 'back' : (params.forward ? 'forward' : 'reload') }
+    try {
+      const snap = await injectWithTimeout(tab.id, pageSnapshot, { maxElements: params.maxElements || 60, text: false }, 8000)
+      out.elementCount = snap.elementCount
+      out.elements = snap.elements
+    } catch (e) { out.snapshotError = String((e && e.message) || e) }
+    return out
+  }
+
   const url = String(params.url || '')
   if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) throw bridgeError('bad_args', `url 需要带 scheme：${url}`)
   let tab
@@ -961,6 +1635,242 @@ async function cmdTabNavigate(params) {
     out.snapshotError = String((e && e.message) || e)
   }
   return out
+}
+
+async function cmdTabKey(params) {
+  const tab = await resolveTab(params.tabId)
+  const keyMode = String(params.mode || 'dom').toLowerCase()
+
+  // ── CDP 模式：真实按键，能触发只认 isTrusted 的站点（如 Google 搜索框回车）──
+  if (keyMode === 'cdp') {
+    if (params.ref) {
+      // 先把焦点放到目标元素上
+      await inject(tab.id, (opts) => {
+        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        if (el && typeof el.focus === 'function') el.focus()
+        return true
+      }, { ref: params.ref }).catch(() => null)
+    }
+    const r = await cdpKey(tab.id, params.key)
+    return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+  }
+
+  assertInjectable(tab)
+  const r = await inject(tab.id, pageKey, {
+    key: params.key,
+    ref: params.ref || null,
+  })
+  const out = { ok: true, tabId: tab.id, key: r.key, resolved: r.resolved, active: r.active }
+  if (params.snapshot === true) {
+    try {
+      const snap = await injectWithTimeout(tab.id, pageSnapshot, { maxElements: 60, text: false }, 6000)
+      out.url = snap.url
+      out.title = snap.title
+      out.elementCount = snap.elementCount
+      out.elements = snap.elements
+    } catch (e) { out.snapshotError = String((e && e.message) || e) }
+  }
+  return out
+}
+
+async function cmdTabScroll(params) {
+  const tab = await resolveTab(params.tabId)
+  assertInjectable(tab)
+  const r = await inject(tab.id, pageScroll, {
+    mode: params.mode || 'by',
+    direction: params.direction || 'down',
+    amount: params.amount,
+    pixels: params.pixels,
+    ref: params.ref || null,
+    block: params.block,
+  })
+  const out = { ok: true, tabId: tab.id, scroll: r }
+  if (params.snapshot === true) {
+    try {
+      const snap = await injectWithTimeout(tab.id, pageSnapshot, { maxElements: 80, text: false }, 8000)
+      out.url = snap.url
+      out.title = snap.title
+      out.elementCount = snap.elementCount
+      out.elements = snap.elements
+    } catch (e) { out.snapshotError = String((e && e.message) || e) }
+  }
+  return out
+}
+
+/** 批量执行：一条消息里跑多个动作，只回一次结果。
+ *
+ *  为什么快：每个命令单独发要一次 WebSocket 往返（本机约 2-5ms，
+ *  但 DOM 操作本身要等渲染），批量后中间动作不产生往返，
+ *  只在最后取一次快照。WorkBuddy 的 features:["batch"] 就是这个。
+ *
+ *  actions: [{ op:'click', ref }, { op:'type', ref, text }, { op:'key', key }, ...]
+ *  每条都是上面单个命令的 params 再加 op 字段。
+ */
+async function cmdTabBatch(params) {
+  const tab = await resolveTab(params.tabId)
+  assertInjectable(tab)
+  const actions = Array.isArray(params.actions) ? params.actions : []
+  if (actions.length === 0) throw bridgeError('bad_args', 'actions 必须是非空数组')
+  if (actions.length > 50) throw bridgeError('bad_args', 'actions 最多 50 条')
+
+  const results = []
+  const t0 = Date.now()
+
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i] || {}
+    const op = String(a.op || '').toLowerCase()
+    const started = Date.now()
+    try {
+      let r
+      if (op === 'click') {
+        r = await inject(tab.id, pageClick, { ref: a.ref || null, x: a.x, y: a.y, double: a.double === true })
+        // 点击可能触发导航：给一点时间，别立刻注入下一条
+        if (a.waitAfter) await sleep(Math.min(5000, Number(a.waitAfter)))
+        else await sleep(80)
+      } else if (op === 'type') {
+        r = await inject(tab.id, pageType, { ref: a.ref, text: a.text, clear: a.clear !== false })
+      } else if (op === 'key') {
+        r = await inject(tab.id, pageKey, { key: a.key, ref: a.ref || null })
+        if (a.waitAfter) await sleep(Math.min(5000, Number(a.waitAfter)))
+      } else if (op === 'scroll') {
+        r = await inject(tab.id, pageScroll, {
+          mode: a.mode || 'by', direction: a.direction || 'down',
+          amount: a.amount, pixels: a.pixels, ref: a.ref || null,
+        })
+        if (a.waitAfter) await sleep(Math.min(5000, Number(a.waitAfter)))
+      } else if (op === 'wait') {
+        await sleep(Math.min(10000, Number(a.ms) || 300))
+        r = { waited: Number(a.ms) || 300 }
+      } else if (op === 'navigate') {
+        await chrome.tabs.update(tab.id, { url: String(a.url || '') })
+        await waitForLoad(tab.id, Math.max(500, Number(a.waitMs) || 400))
+        r = { navigated: true }
+      } else if (op === 'snapshot') {
+        r = await injectWithTimeout(tab.id, pageSnapshot,
+          { maxElements: a.maxElements || 60, text: a.text === true }, 8000)
+      } else {
+        throw bridgeError('bad_args', `不支持的 op: ${op}（可用 click/type/key/scroll/wait/navigate/snapshot）`)
+      }
+      results.push({ index: i, op, ok: true, costMs: Date.now() - started, result: r })
+    } catch (e) {
+      results.push({
+        index: i, op, ok: false, costMs: Date.now() - started,
+        error: { code: (e && e.code) || 'action_failed', message: String((e && e.message) || e) },
+      })
+      // 默认遇错即停（fail-fast），除非显式 continueOnError
+      if (params.continueOnError !== true) break
+    }
+  }
+
+  // 最后统一取一次快照（批量最大的收益点）
+  const out = {
+    ok: results.every((x) => x.ok),
+    tabId: tab.id,
+    actionCount: actions.length,
+    executed: results.length,
+    costMs: Date.now() - t0,
+    results,
+  }
+  if (params.snapshot !== false) {
+    try {
+      const snap = await injectWithTimeout(tab.id, pageSnapshot,
+        { maxElements: params.maxElements || 80, text: false }, 10000)
+      out.url = snap.url
+      out.title = snap.title
+      out.elementCount = snap.elementCount
+      out.elements = snap.elements
+      out.text = snap.text
+    } catch (e) { out.snapshotError = String((e && e.message) || e) }
+  }
+  return out
+}
+
+async function cmdTabEval(params) {
+  const tab = await resolveTab(params.tabId)
+  assertInjectable(tab)
+  const expr = String(params.expr || '')
+  const beforeUrl = tab.url || ''
+
+  // 表达式里如果有导航（location.href= / location.assign / location.replace /
+  // window.open），注入脚本会被卸载 → Promise 永不 resolve → 20s 超时。
+  // 处理方式和点击导航一致：先返回，再让页面自己跳。
+  const navigates = /\blocation\s*\.\s*(href\s*=|assign|replace)|window\s*\.\s*open\s*\(/.test(expr)
+
+  if (navigates) {
+    const fire = evaluateInPage(tab.id, expr)
+    // 最多等 1.5s 拿返回值；拿不到就认为它去导航了
+    const raced = await Promise.race([
+      fire.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e })),
+      sleep(1500).then(() => ({ ok: false, e: new Error('navigating') })),
+    ])
+
+    // 等 URL 变化 + 加载完成
+    for (let i = 0; i < 40; i++) {
+      await sleep(150)
+      let now
+      try { now = await chrome.tabs.get(tab.id) } catch { break }
+      if (now.url && now.url !== beforeUrl && now.status === 'complete') break
+    }
+    let fresh = tab
+    try { fresh = await chrome.tabs.get(tab.id) } catch { /* ignore */ }
+    return {
+      ok: true, tabId: tab.id, navigated: true,
+      url: fresh.url || '', title: fresh.title || '',
+      value: raced.ok && raced.v ? raced.v.value : null,
+    }
+  }
+
+  const r = await evaluateInPage(tab.id, expr)
+  if (!r.ok) throw bridgeError(r.error.code, r.error.message)
+  return { ok: true, tabId: tab.id, value: r.value, type: r.type, via: r.via }
+}
+
+/** 拖拽（CDP 真实鼠标）。from/to 都是视口坐标，也可以给两个 ref。 */
+async function cmdTabDrag(params) {
+  const tab = await resolveTab(params.tabId)
+  const resolvePoint = async (ref, x, y) => {
+    if (ref) {
+      const box = await inject(tab.id, (opts) => {
+        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        if (!el) return null
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+        const r = el.getBoundingClientRect()
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+      }, { ref }).catch(() => null)
+      if (!box) throw bridgeError('stale_ref', `找不到 ref=${ref}`)
+      return box
+    }
+    if (!Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) {
+      throw bridgeError('bad_args', '需要 ref 或 x/y')
+    }
+    return { x: Number(x), y: Number(y) }
+  }
+  const from = await resolvePoint(params.fromRef, params.fromX, params.fromY)
+  const to = await resolvePoint(params.toRef, params.toX, params.toY)
+  const r = await cdpDrag(tab.id, from, to, { steps: params.steps })
+  return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+}
+
+/** 鼠标动作：move / wheel。 */
+async function cmdTabMouse(params) {
+  const tab = await resolveTab(params.tabId)
+  const action = String(params.action || 'wheel').toLowerCase()
+  const x = Number(params.x)
+  const y = Number(params.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) throw bridgeError('bad_args', '需要 x/y')
+
+  if (action === 'wheel' || action === 'scroll') {
+    const r = await cdpScroll(tab.id, x, y, Number(params.deltaX) || 0, Number(params.deltaY) || 0)
+    return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+  }
+  if (action === 'move') {
+    const r = await withDebugger(tab.id, async (send) => {
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y })
+      return { moved: { x, y } }
+    })
+    return { ok: true, tabId: tab.id, mode: 'cdp', ...r }
+  }
+  throw bridgeError('bad_args', `不支持的 action: ${action}（可用 move/wheel）`)
 }
 
 async function cmdTabScreenshot(params) {
@@ -1126,7 +2036,7 @@ async function cmdTabClose(params) {
 /* ── 标签分组 ──────────────────────────────────────────────────────────
  *
  * Chrome 的 tabGroups API：一个分组属于一个窗口，有 title / color / collapsed。
- * 要实现的效果：DSH 一动手，被操作的页面就自动落进「wxs-lang」这个分组，
+ * 要实现的效果：DSH 一动手，被操作的页面就自动落进「大肥鱼」这个分组，
  * 名称与配色由我们统一，用户在标签栏上扫一眼就知道"这些页面是它在操作"。
  *
  * 注意：groupId 是 -1 表示"不属于任何组"，且一个组只属于一个窗口 —— 跨窗口时
@@ -1134,7 +2044,7 @@ async function cmdTabClose(params) {
  */
 
 /** 默认分组名与配色。扩展里读不到 DSH 的环境变量，只能靠参数或常量传递。 */
-const DEFAULT_GROUP_TITLE = 'wxs-lang'
+const DEFAULT_GROUP_TITLE = '大肥鱼'
 const VALID_COLORS = ['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange']
 
 function normColor(c) {
@@ -1320,8 +2230,47 @@ async function waitForLoad(tabId, waitMs) {
 
 watchSystemTheme()
 
-chrome.runtime.onInstalled.addListener(() => { connectAll() })
-chrome.runtime.onStartup.addListener(() => { connectAll() })
+/** 建一个每分钟触发一次的 alarm：SW 睡着后靠它醒来自动重连。
+ *  alarm 已存在时 chrome.alarms.create 会覆盖同名的，重复调用无副作用。 */
+function ensureKeepAlive() {
+  try {
+    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_MINUTES })
+  } catch { /* 没有 alarms 权限就退化成只在 SW 活着时重连 */ }
+}
+
+try {
+  chrome.alarms.onAlarm.addListener((a) => {
+    if (!a || a.name !== KEEPALIVE_ALARM) return
+    // alarm 唤醒的这一轮 SW 里，links 可能是空的（上次休眠前就断了）
+    for (const port of BRIDGE_PORTS) {
+      const l = link(port)
+      if (l.ws && l.ws.readyState === WebSocket.OPEN) continue
+      connect(port)
+    }
+  })
+} catch { /* 老浏览器没有 alarms 就算了 */ }
+
+ensureKeepAlive()
+
+/* 租约到期自动回收。
+ *
+ * 必须用 chrome.alarms 而不是 setInterval：MV3 的 Service Worker 会在闲置
+ * 约 30s 后被浏览器卸载，setInterval 随之消失（实测"到期不回收"就是这个原因）。
+ * alarms 由浏览器托管，SW 睡着也会在到点时把它唤醒。 */
+const LEASE_ALARM = 'dsh-bridge-lease-reap'
+try {
+  chrome.alarms.create(LEASE_ALARM, { periodInMinutes: 0.5 })
+  chrome.alarms.onAlarm.addListener((a) => {
+    if (!a || a.name !== LEASE_ALARM) return
+    const now = Date.now()
+    for (const [id, l] of [...leases]) {
+      if (l.deadline <= now) releaseLease(id).catch(() => { /* ignore */ })
+    }
+  })
+} catch { /* 没有 alarms 权限就退化成只在 release 时清理 */ }
+
+chrome.runtime.onInstalled.addListener(() => { ensureKeepAlive(); connectAll(); connectNative() })
+chrome.runtime.onStartup.addListener(() => { ensureKeepAlive(); connectAll(); connectNative() })
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg && msg.type === 'dsh-bridge-state') {
     const states = {}
@@ -1347,7 +2296,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 try {
   chrome.runtime.onInstalled.addListener(() => {
     const items = [
-      { id: 'grp-selected', title: '把所有标签收进「wxs-lang」分组并折叠' },
+      { id: 'grp-selected', title: '把所有标签收进「大肥鱼」分组并折叠' },
       { id: 'detach-all', title: '清理调试会话（顺带去掉图标角标）' },
       { id: 'open-panel', title: '打开状态面板' },
     ]
@@ -1363,7 +2312,7 @@ try {
       const ids = tabs.filter((t) => !/^(chrome|edge|about|devtools|chrome-extension):/i.test(t.url || '')).map((t) => t.id)
       if (ids.length > 0) {
         const gid = await chrome.tabs.group({ tabIds: ids })
-        await chrome.tabGroups.update(gid, { title: 'wxs-lang', color: 'cyan', collapsed: true })
+        await chrome.tabGroups.update(gid, { title: '大肥鱼', color: 'cyan', collapsed: true })
       }
     } else if (info.menuItemId === 'detach-all') {
       const targets = await chrome.debugger.getTargets()
@@ -1385,3 +2334,6 @@ try {
 chrome.action.onClicked.addListener(() => { connectAll() })
 
 connectAll()
+
+// 顶层也尝试连 native（SW 每次被拉起时都会跑到这里）
+connectNative()

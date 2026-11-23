@@ -10,7 +10,7 @@
 import { WebSocket } from 'ws'
 
 const PORT = 39415
-const mod = await import(new URL('../index.js', import.meta.url).href)
+const mod = await import(new URL('../impl.js', import.meta.url).href)
 
 let pass = 0
 let fail = 0

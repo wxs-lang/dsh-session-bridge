@@ -86,9 +86,9 @@ async function refresh() {
 
   try {
     const groups = await chrome.tabGroups.query({})
-    const mine = groups.filter((g) => g.title === 'wxs-lang')
+    const mine = groups.filter((g) => g.title === '大肥鱼')
     $('v-groups').textContent = mine.length
-      ? `${groups.length} 个（其中 wxs-lang 占 ${mine.length} 个，当前${mine[0].collapsed ? '折叠' : '展开'}）`
+      ? `${groups.length} 个（其中 大肥鱼 占 ${mine.length} 个，当前${mine[0].collapsed ? '折叠' : '展开'}）`
       : String(groups.length)
   } catch { $('v-groups').textContent = '—' }
 

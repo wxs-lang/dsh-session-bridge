@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "wxs-lang · DSH Browser Bridge",
-  "version": "1.6.0",
+  "name": "大肥鱼 · DSH Browser Bridge",
+  "version": "2.2.0",
   "description": "让 DSH 在你已登录的浏览器里后台干活：点击、输入、截图、开关标签，全程不抢焦点。",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -32,7 +32,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "wxs-lang · DSH Browser Bridge",
+    "default_title": "大肥鱼 · DSH Browser Bridge",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

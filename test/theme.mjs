@@ -23,7 +23,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let pass = 0, fail = 0
 const ok = (c, n, e = '') => { if (c) { pass++; console.log(`  ✓ ${n}${e ? ` — ${e}` : ''}`) } else { fail++; console.log(`  ✗ ${n}${e ? ` — ${e}` : ''}`) } }
 
-const mod = await import(new URL('../index.js', import.meta.url).href)
+const mod = await import(new URL('../impl.js', import.meta.url).href)
 mod.apply({
   logger: { info: () => {}, warn: () => {}, error: () => {} },
   tools: { register: () => () => {} },

@@ -106,14 +106,61 @@ cp -r dsh-browser-bridge "$DSH_HOME/profiles/desktop/vendor/"
 **其他浏览器**（Edge / Brave / QQ浏览器 / 360）照做一遍，指同一个目录即可——
 它们会各自连上桥，互不干扰。
 
-### 三、验证
+### 三、装原生宿主（可选，但强烈建议）
+
+MV3 的 Service Worker 会被浏览器卸载，卸载时 WebSocket 一起断。只靠 WebSocket，
+断线后要等 `chrome.alarms` 唤醒（最长 60 秒）才能重连。
+
+原生消息宿主（native messaging）把这条路堵死：**宿主进程由浏览器负责拉起**，
+扩展一醒来就 `connectNative()`，不存在等 alarm 的窗口期。
+
+```
+# 1. 确认 ws 模块可用（native-host.mjs 用它连桥）
+#    插件装在 profile 的 vendor/ 下时，通常能解析到 profile 的 node_modules
+node -e "require('ws'); console.log('ws ok')"
+
+# 2. 把 com.dsh.bridge.json 里的两处改成你自己的路径 / 扩展 ID
+#    path          → 本机 dsh-bridge-native.cmd 的绝对路径
+#    allowed_origins → 你装上扩展后拿到的 chrome-extension://<id>/
+```
+
+改完注册（Windows，当前用户即可，不需要管理员）：
+
+```bat
+reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dsh.bridge" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+
+rem Edge
+reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dsh.bridge" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+
+rem QQ浏览器
+reg add "HKCU\Software\Tencent\QQBrowser\NativeMessagingHosts\com.dsh.bridge" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+```
+
+装完重载一次扩展。之后浏览器会自己维护宿主进程——杀掉了会重新拉起。
+
+### 四、验证
 
 ```
 browser_status
-→ { "extensions": 1, "connections": [{ "brand": "Chrome", "commands": 18 }] }
+→ {
+    "extensions": 2,
+    "extensionVersion": "2.2.0",
+    "connections": [
+      { "brand": "Chrome",     "commands": 29, "windows": [290992688] },
+      { "brand": "NativeHost", "commands": 30 }
+    ],
+    "codeFresh": { "stale": false }
+  }
 ```
 
-看到 `extensions: 1` 就通了。
+看到 `extensions >= 1` 且 `stale: false` 就通了。
+
+> `NativeHost` 那条连接是中继通道（宿主进程 ↔ 扩展），不是独立浏览器，
+> 它不该拥有标签页。桥的路由会把它排除在 tabId 归属之外，只在没有真实浏览器
+> 可用时才兜底。
 
 ---
 
@@ -127,15 +174,110 @@ browser_status
 | `browser_snapshot` | 页面可交互元素快照（带 ref，供点击/输入引用） |
 | `browser_click` | 点击（`ref` 或视口坐标） |
 | `browser_type` | 输入文本 |
-| `browser_navigate` | 打开 / 跳转（**默认后台，不切前台**） |
+| **`browser_key`** | **按键：`Enter` / `Escape` / `Control+a` / `Shift+Tab`** |
+| **`browser_scroll`** | **滚动：按屏 / 滚到元素 / 到顶 / 到底** |
+| **`browser_batch`** | **批量动作，只回一次结果（实测快 11 倍）** |
+| **`browser_eval`** | **页面内执行 JS（走 CDP，绕过页面 CSP）** |
+| **`browser_drag`** | **拖拽（CDP 真实鼠标按下→移动→释放）** |
+| **`browser_mouse`** | **鼠标移动 / 滚轮（CDP）** |
+| **`browser_lease`** | **租约：临时标签到期自动清理** |
+| `browser_navigate` | 打开 / 跳转 / **`back` `forward` `reload`** |
 | `browser_screenshot` | 截图（**CDP 后台取帧，全程不碰焦点**） |
 | `browser_close_tabs` | 关闭标签页 |
-| `browser_group_ensure` | 把标签收进「wxs-lang」分组 |
+| `browser_group_ensure` | 把标签收进「大肥鱼」分组 |
 | `browser_group_assign` / `list` / `update` / `close` | 分组增删改查 |
 | `browser_theme` | 扩展图标主题（跟随系统深浅色） |
 | `browser_reload` | 热重载插件本身（不必重启 DSH） |
 
 所有工具都认 `browser` 参数：`auto`（默认）/ `chrome` / `edge` / `qqbrowser`。
+
+---
+
+## 双引擎：DOM 注入 vs CDP 真实输入
+
+每个操作工具都有 `mode` 参数，两种引擎各有用处：
+
+| 引擎 | `mode` | 原理 | 优点 | 缺点 |
+|---|---|---|---|---|
+| **DOM 注入** | `dom`（默认） | `chrome.scripting.executeScript` 在页面里合成事件 | 快（毫秒级）、不需要 attach、无调试横幅 | `event.isTrusted === false`，被防自动化站点拒绝 |
+| **CDP 真实输入** | `cdp` | `chrome.debugger` + `Input.dispatchKeyEvent` / `Input.dispatchMouseEvent` | `isTrusted === true`，能触发任何站点 | 需要 attach（有调试横幅）、略慢 |
+
+**实测差异**（本地页面，监听 `event.isTrusted` 才处理）：
+
+```
+dom 模式 Enter  →  keydown Enter trusted=false  →  (untrusted enter ignored)
+cdp 模式 Enter  →  keydown Enter trusted=true   →  *** TRUSTED ENTER => SUBMIT ***
+```
+
+真实世界的例子：**Google 搜索框**只认真实 Enter，`dom` 模式输入后按回车没反应，必须 `mode: "cdp"`。
+
+```js
+browser_key({ tabId, ref: inputRef, key: 'Enter', mode: 'cdp' })
+browser_click({ tabId, ref: btnRef, mode: 'cdp' })
+```
+
+### CDP 模式的三个必须步骤
+
+这些一开始我漏了，导致输入事件被静默丢弃：
+
+```js
+await chrome.debugger.attach(target, '1.3')
+await chrome.debugger.sendCommand(target, 'Runtime.enable')          // ← 漏了会丢事件
+await chrome.debugger.sendCommand(target, 'Page.enable')             // ← 同上
+await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
+                                                                      // ← 漏了后台标签会被节流
+```
+
+### 滚轮的坑
+
+某些 Chrome 版本上 `Input.dispatchMouseEvent({type:'mouseWheel'})` 既不派发 `wheel` 事件也不滚动。
+`browser_mouse` 里的实现是 **CDP 优先 + DOM 兜底**：CDP 试过后检查 `scrollY` 有没有变，没变就用原生 `wheel` 事件 + `scrollBy` 补一次。
+
+---
+
+## 租约：临时标签自动清理
+
+跑一个流程会临时开若干标签页。不管的话用户的标签栏越堆越多。
+
+```js
+const { leaseId } = await browser_lease({ action: 'open', ttlMs: 600000 })
+const { tabId } = await browser_navigate({ url: '...', newTab: true })
+await browser_lease({ action: 'attach', leaseId, tabIds: [tabId] })
+
+// ... 干活 ...
+
+await browser_lease({ action: 'release', leaseId })   // 关掉这次新建的标签
+// 或者不管它，到期自动回收
+```
+
+**用户原有的标签永远不碰。** 到期回收用 `chrome.alarms` 而不是 `setInterval` ——
+MV3 的 Service Worker 会被卸载，`setInterval` 随之消失（我实测踩过这个坑，表现是"到期不回收"）。
+
+---
+
+## 性能
+
+**批量 vs 逐条**（本地测试页，4 个动作：点击 → 输入 → Tab → 快照）：
+
+```
+browser_batch    313 ms
+逐条 4 次调用    3546 ms      ← 快 11 倍
+```
+
+原因：批量只产生 1 次往返 + 1 次快照；逐条每条都往返，且默认每条都带快照。
+
+固定序列（登录、填表、提交）一律用 `browser_batch`：
+
+```js
+browser_batch({
+  tabId,
+  actions: [
+    { op: 'click', ref: 'e5' },
+    { op: 'type', ref: 'e7', text: 'hello' },
+    { op: 'key', key: 'Enter', waitAfter: 800 },
+  ],
+})
+```
 
 ---
 
@@ -180,6 +322,13 @@ browser_navigate({ url: "...", browser: "qqbrowser" })  // 只动 QQ浏览器
 | 超大页面文本会截断 | 超过 8 万字符的页面改用 `textContent` 粗略提取，不是精确可见文本 |
 | 截图只含可视区 | 没有整页滚动拼接 |
 | 扩展冷启动首批调用偶发失败 | `tab.navigate` 极低概率拿不到 tabId，扩展侧有兜底重查，测试侧带重试 |
+| `dom` 模式的事件不被信任 | `isTrusted === false`，防自动化站点会忽略。这类站点必须用 `mode: "cdp"` |
+| `cdp` 模式有调试横幅 | `chrome.debugger.attach` 期间页面顶部会显示"XX 正在调试此浏览器"，detach 后消失 |
+| `cdp` 模式会被其他调试器挡住 | DevTools 或另一个扩展正在调试该标签时 attach 失败，返回 `debugger_busy` |
+| 系统级快捷键仍做不到 | `Ctrl+W` / `Ctrl+T` 这类浏览器级快捷键走页面事件无效，需要 CDP `Input.dispatchKeyEvent` 且要浏览器接受 |
+| `browser_eval` 依赖 CDP | 目标标签被别的调试器占用时会 attach 失败；`chrome://` 页不可用 |
+| `back` / `forward` 需要真实历史条目 | `chrome.tabs.update` 跳到同一文档内不同 query **不产生历史**，会报 `no_history` |
+| 批量里 `navigate` 会中断后续动作 | 整页跳转会销毁脚本上下文，`browser_batch` 遇到导航会提前结束 |
 | 需要 DSH | 这是 DSH 插件，不是独立 CLI |
 
 ---

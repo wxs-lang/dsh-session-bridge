@@ -37,7 +37,7 @@ const srv = createServer((req, res) => {
 await new Promise((r) => srv.listen(LOCAL_PORT, '127.0.0.1', r))
 
 // 2) 本进程起桥
-const mod = await import(new URL('../index.js', import.meta.url).href)
+const mod = await import(new URL('../impl.js', import.meta.url).href)
 mod.apply({
   logger: { info: () => {}, warn: () => {}, error: () => {} },
   tools: { register: () => () => {} },

@@ -36,7 +36,7 @@ for (const cmd of ['group.ensure', 'group.assign', 'group.list', 'group.update',
 }
 
 // 1) 本进程起桥（真实插件代码）
-const mod = await import(new URL('../index.js', import.meta.url).href)
+const mod = await import(new URL('../impl.js', import.meta.url).href)
 const stub = {
   logger: { info: () => {}, warn: () => {}, error: () => {} },
   tools: { register: () => () => {} },
@@ -124,10 +124,10 @@ const mine = list.filter((t) => String(t.url).includes(`127.0.0.1:${LOCAL_PORT}`
 ok(mine.length >= 2, '本地测试页有 2 个以上', `count=${mine.length}`)
 
 console.log('\n--- group.ensure（批量归组）---')
-const ens = await rpc('group.ensure', { tabIds: mine.map((t) => t.id), title: 'wxs-lang', color: 'cyan' })
+const ens = await rpc('group.ensure', { tabIds: mine.map((t) => t.id), title: '大肥鱼', color: 'cyan' })
 ok(ens.ok === true, 'group.ensure ok', ens.ok ? `groups=${(ens.groups || []).length}` : JSON.stringify(ens).slice(0, 120))
 const g = (ens.groups || [])[0]
-ok(g && g.title === 'wxs-lang', '组名是「wxs-lang」', g ? g.title : '')
+ok(g && g.title === '大肥鱼', '组名是「大肥鱼」', g ? g.title : '')
 ok(g && g.color === 'cyan', '组颜色 cyan', g ? g.color : '')
 ok(g && g.tabIds.length >= 2, '批量搬进去的页数正确', g ? `${g.tabIds.length}` : '')
 ok(g && g.collapsed === true, '★ 新建的组默认是折叠的', g ? `collapsed=${g.collapsed}` : '')
@@ -135,8 +135,8 @@ ok(g && g.collapsed === true, '★ 新建的组默认是折叠的', g ? `collaps
 console.log('\n--- group.list ---')
 const gl = await rpc('group.list', {})
 ok(gl.ok === true && (gl.groups || []).length >= 1, 'group.list 有组', `count=${gl.count}`)
-const listed = (gl.groups || []).find((x) => x.title === 'wxs-lang')
-ok(!!listed, '列表里能看到「wxs-lang」组', listed ? `groupId=${listed.groupId} tabs=${listed.tabCount} collapsed=${listed.collapsed}` : '')
+const listed = (gl.groups || []).find((x) => x.title === '大肥鱼')
+ok(!!listed, '列表里能看到「大肥鱼」组', listed ? `groupId=${listed.groupId} tabs=${listed.tabCount} collapsed=${listed.collapsed}` : '')
 ok(listed && listed.collapsed === true, '★ group.list 里也是 collapsed', listed ? `collapsed=${listed.collapsed}` : '')
 if (listed) {
   ok(listed.tabs.every((t) => String(t.url).includes(`127.0.0.1:${LOCAL_PORT}`) || true), '组内页面可枚举')
@@ -150,10 +150,10 @@ if (listed) {
   // 折回去，验证 update 也能折叠
   const re = await rpc('group.update', { groupId: listed.groupId, collapsed: true })
   ok(re.ok === true && re.group.collapsed === true, 'group.update 能重新折叠', re.ok ? `collapsed=${re.group.collapsed}` : '')
-  const up2 = await rpc('group.update', { groupId: listed.groupId, title: 'wxs-lang·DSH' })
-  ok(up2.ok === true && up2.group.title === 'wxs-lang·DSH', '组名改成「wxs-lang·DSH」', up2.ok ? up2.group.title : '')
+  const up2 = await rpc('group.update', { groupId: listed.groupId, title: '大肥鱼·DSH' })
+  ok(up2.ok === true && up2.group.title === '大肥鱼·DSH', '组名改成「大肥鱼·DSH」', up2.ok ? up2.group.title : '')
   // 改回来
-  await rpc('group.update', { groupId: listed.groupId, title: 'wxs-lang', color: 'cyan' })
+  await rpc('group.update', { groupId: listed.groupId, title: '大肥鱼', color: 'cyan' })
 }
 
 console.log('\n--- 已展开的组，再次 ensure 应归一化回折叠 ---')
@@ -161,7 +161,7 @@ if (listed) {
   await rpc('group.update', { groupId: listed.groupId, collapsed: false })
   const before = (await rpc('group.list', {})).groups.find((x) => x.groupId === listed.groupId)
   ok(before && before.collapsed === false, '先手动展开', before ? `collapsed=${before.collapsed}` : '')
-  const re2 = await rpc('group.ensure', { tabId: listed.tabs[0].id, title: 'wxs-lang', color: 'cyan' })
+  const re2 = await rpc('group.ensure', { tabId: listed.tabs[0].id, title: '大肥鱼', color: 'cyan' })
   ok(re2.ok === true && (re2.groups || [])[0]?.collapsed === true, '★ ensure 把已展开的组收回折叠',
     re2.ok ? `collapsed=${(re2.groups || [])[0]?.collapsed}` : '')
 }
@@ -170,7 +170,7 @@ console.log('\n--- group.assign（移出分组）---')
 if (listed && listed.tabs[0]) {
   const out = await rpc('group.assign', { tabId: listed.tabs[0].id, groupId: -1 })
   ok(out.ok === true && out.ungroupped === true, '把一个 tab 移出分组', `tabId=${listed.tabs[0].id}`)
-  const back = await rpc('group.assign', { tabId: listed.tabs[0].id, title: 'wxs-lang', color: 'cyan' })
+  const back = await rpc('group.assign', { tabId: listed.tabs[0].id, title: '大肥鱼', color: 'cyan' })
   ok(back.ok === true, '再放回去', back.ok ? `groupId=${back.groupId}` : '')
 }
 
@@ -185,11 +185,11 @@ console.log('\n--- 插件自动归组（browser_snapshot 后 tab 自己进组）
     const snap = await rpc('tab.snapshot', { tabId: example.id, maxElements: 5 })
     ok(snap.ok === true, 'snapshot 成功')
     // 插件侧的 autoGroup 走的是工具层，这里直接手动调一次等价验证
-    const ens2 = await rpc('group.ensure', { tabId: example.id, title: 'wxs-lang', color: 'cyan' })
+    const ens2 = await rpc('group.ensure', { tabId: example.id, title: '大肥鱼', color: 'cyan' })
     ok(ens2.ok === true, 'group.ensure(单 tab) ok', ens2.ok ? `groupId=${(ens2.groups || [])[0]?.groupId}` : 'ERR=' + JSON.stringify(ens2).slice(0, 200))
     const after = await rpc('group.list', {})
     const nowIn = (after.groups || []).some((x) => x.tabs.some((t) => t.id === example.id))
-    ok(nowIn, 'example.com 现在在「wxs-lang」组里')
+    ok(nowIn, 'example.com 现在在「大肥鱼」组里')
   } else {
     console.log('  (跳过：没找到 example.com)')
   }
@@ -198,7 +198,7 @@ console.log('\n--- 插件自动归组（browser_snapshot 后 tab 自己进组）
 console.log('\n--- group.close ---')
 {
   const before = await rpc('group.list', {})
-  const target = (before.groups || []).find((x) => x.title === 'wxs-lang')
+  const target = (before.groups || []).find((x) => x.title === '大肥鱼')
   if (target) {
     const n = target.tabCount
     const cl = await rpc('group.close', { groupId: target.groupId })
@@ -208,7 +208,7 @@ console.log('\n--- group.close ---')
     let cl2 = cl
     if (!cl.ok && /group_not_found|not_found/i.test(String(cl.error || ''))) {
       const again = (await rpc('group.list', {})).groups || []
-      const t2 = again.find((x) => x.title === 'wxs-lang')
+      const t2 = again.find((x) => x.title === '大肥鱼')
       if (t2) cl2 = await rpc('group.close', { groupId: t2.groupId })
     }
     ok(cl2.ok === true && cl2.closed === n,
