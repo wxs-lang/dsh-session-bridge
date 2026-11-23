@@ -1,5 +1,5 @@
 /**
- * smoke.mjs — dsh-browser-bridge 自测脚本（两段式）
+ * smoke.mjs — dsh-session-bridge 自测脚本（两段式）
  *
  * 用法（在任意目录）：
  *   node test/smoke.mjs
@@ -94,7 +94,7 @@ console.log(`插件入口: ${PLUGIN_ENTRY}`)
 
 const mod = await import(pathToFileURL(PLUGIN_ENTRY).href)
 assertTrue(typeof mod.apply === 'function', 'apply 导出为函数')
-assertTrue(mod.name === 'dsh-browser-bridge', 'export const name', mod.name)
+assertTrue(mod.name === 'dsh-session-bridge', 'export const name', mod.name)
 assertTrue(Array.isArray(mod.inject) && mod.inject.includes('tools') && mod.inject.includes('systemPrompt'), 'export const inject', JSON.stringify(mod.inject))
 
 mod.apply(stubCtx, { port: PORT })

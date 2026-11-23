@@ -12,7 +12,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 const runAll = process.argv.includes('--all')
 
 // unit: 纯 stub / 静态检查，任何机器都能跑
-const UNIT = ['icons.mjs', 'yaml-check.mjs', 'multi-browser.mjs', 'resilience.mjs']
+const UNIT = ['icons.mjs', 'yaml-check.mjs', 'multi-browser.mjs', 'resilience.mjs',
+  'security.mjs', 'hotreload.mjs', 'connmgmt.mjs']
 // e2e: 需要真实 Chrome + 加载扩展 + 特定启动参数
 const E2E = ['focus.mjs', 'groups.mjs', 'theme.mjs']
 // live: 需要对端真实页面

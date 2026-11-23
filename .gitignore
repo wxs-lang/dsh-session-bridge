@@ -27,3 +27,7 @@ tmp-*.mjs
 
 # 本机专属：native messaging 清单含绝对路径与扩展 ID，不入库（用 .example 作模板）
 com.dsh.bridge.json
+
+# 本机专属：native messaging 清单含绝对路径与扩展 ID
+com.dsh.session.json
+package-lock.json

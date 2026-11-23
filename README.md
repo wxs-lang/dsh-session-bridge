@@ -1,6 +1,6 @@
 <div align="center">
 
-# DSH Browser Bridge
+# DSH Session Bridge
 
 **把你自己那个已经登录好的浏览器，变成 DSH 的手。**
 
@@ -32,7 +32,7 @@ Chrome / Edge / Brave / QQ浏览器 可以同时接入，各自独立
 
 这个插件走的是反方向——**借用你桌上那台已经登录的浏览器**。
 
-|  | Playwright / Puppeteer | DSH Browser Bridge |
+|  | Playwright / Puppeteer | DSH Session Bridge |
 |---|---|---|
 | 浏览器实例 | 新开一个 | 就用你正在用的那个 |
 | 登录态 | 无，得重新登 | 全都在，直接可用 |
@@ -73,7 +73,7 @@ tabId 全局唯一  →  桥记住每个 tabId 归哪个连接  →  带 tabId �
 # 放进 DSH profile 的 vendor 目录
 #   Windows : %USERPROFILE%\.dsh\profiles\desktop\vendor\
 #   macOS/Linux : ~/.dsh/profiles/desktop/vendor/
-cp -r dsh-browser-bridge "$DSH_HOME/profiles/desktop/vendor/"
+cp -r dsh-session-bridge "$DSH_HOME/profiles/desktop/vendor/"
 ```
 
 把仓库里的 `cordis.patch.yml` **合并**进
@@ -81,8 +81,8 @@ cp -r dsh-browser-bridge "$DSH_HOME/profiles/desktop/vendor/"
 
 ```yaml
 - insert:
-    - id: dsh-browser-bridge
-      name: dsh-browser-bridge
+    - id: dsh-session-bridge
+      name: dsh-session-bridge
       inject: [ systemPrompt, tools ]
       config: {}
 ```
@@ -98,7 +98,7 @@ cp -r dsh-browser-bridge "$DSH_HOME/profiles/desktop/vendor/"
 1. 打开 chrome://extensions
 2. 右上角打开「开发者模式」
 3. 点「加载已解压的扩展程序」
-4. 选择 dsh-browser-bridge/extension 目录
+4. 选择 dsh-session-bridge/extension 目录
 ```
 
 装好后图标是条蓝鲸鱼：白天蓝色，夜间纯黑，跟着系统深浅色自动换。
@@ -119,24 +119,24 @@ MV3 的 Service Worker 会被浏览器卸载，卸载时 WebSocket 一起断。�
 #    插件装在 profile 的 vendor/ 下时，通常能解析到 profile 的 node_modules
 node -e "require('ws'); console.log('ws ok')"
 
-# 2. 把 com.dsh.bridge.json 里的两处改成你自己的路径 / 扩展 ID
-#    path          → 本机 dsh-bridge-native.cmd 的绝对路径
+# 2. 把 com.dsh.session.json 里的两处改成你自己的路径 / 扩展 ID
+#    path          → 本机 dsh-session-native.cmd 的绝对路径
 #    allowed_origins → 你装上扩展后拿到的 chrome-extension://<id>/
 ```
 
 改完注册（Windows，当前用户即可，不需要管理员）：
 
 ```bat
-reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dsh.bridge" /ve ^
-  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dsh.session" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.session.json" /f
 
 rem Edge
-reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dsh.bridge" /ve ^
-  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dsh.session" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.session.json" /f
 
 rem QQ浏览器
-reg add "HKCU\Software\Tencent\QQBrowser\NativeMessagingHosts\com.dsh.bridge" /ve ^
-  /t REG_SZ /d "<本插件目录>\com.dsh.bridge.json" /f
+reg add "HKCU\Software\Tencent\QQBrowser\NativeMessagingHosts\com.dsh.session" /ve ^
+  /t REG_SZ /d "<本插件目录>\com.dsh.session.json" /f
 ```
 
 装完重载一次扩展。之后浏览器会自己维护宿主进程——杀掉了会重新拉起。

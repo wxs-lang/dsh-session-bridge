@@ -1,5 +1,5 @@
 /**
- * dsh-browser-bridge — 浏览器操控桥插件
+ * dsh-session-bridge — 浏览器操控桥插件
  *
  * 让 DSH 直接操控用户**自己的** Chrome / Edge / QQ浏览器：
  *   · 复用用户已经登录的会话（cookie / 登录态 / 扩展环境）
@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
@@ -36,9 +37,9 @@ const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
  */
 function pickExtDir() {
   const own = join(PLUGIN_DIR, 'extension')
-  // <profile>/node_modules/dsh-browser-bridge  → <profile>/vendor/dsh-browser-bridge/extension
+  // <profile>/node_modules/dsh-session-bridge  → <profile>/vendor/dsh-session-bridge/extension
   const parent = dirname(dirname(PLUGIN_DIR)) // profile 根
-  const vendorExt = join(parent, 'vendor', 'dsh-browser-bridge', 'extension')
+  const vendorExt = join(parent, 'vendor', 'dsh-session-bridge', 'extension')
   try {
     if (existsSync(join(vendorExt, 'manifest.json')) && existsSync(join(own, 'manifest.json'))) {
       // 原件与副本同时存在：优先原件（用户编辑的那份）
@@ -54,8 +55,8 @@ const DEFAULT_PORT = 39401
 const DEFAULT_TIMEOUT = 20000
 
 /* ── 依赖解析：ws ─────────────────────────────────────────────────────
- * 插件可能位于 <profile>/vendor/dsh-browser-bridge（原件）
- * 也可能位于 <profile>/node_modules/dsh-browser-bridge（安装副本）
+ * 插件可能位于 <profile>/vendor/dsh-session-bridge（原件）
+ * 也可能位于 <profile>/node_modules/dsh-session-bridge（安装副本）
  * 两种位置 createRequire 向上都能摸到 <profile>/node_modules/ws。
  */
 // 本模块被 import 的时刻。用来判断"磁盘上的文件是不是比内存里的代码新"。
@@ -65,6 +66,31 @@ const DEFAULT_TIMEOUT = 20000
 const MODULE_LOADED_AT = Date.now()
 
 let WebSocketServer = null
+
+/* ── 来源校验 ──────────────────────────────────────────────────────────
+ *
+ * 桥监听在 127.0.0.1，但这不等于安全：**任何网页都能连本地回环端口**。
+ * 恶意页只要 `new WebSocket('ws://127.0.0.1:39401')` 就能借用户已登录的
+ * 浏览器发请求、读页面、截屏 —— 桥自己没有任何鉴权。
+ *
+ * 浏览器发起 WebSocket 时一定带 Origin 头，Node 的 ws 客户端（原生宿主）
+ * 不带。所以规则很简单：
+ *
+ *   无 Origin            → 放行（native host 这条通道）
+ *   chrome-extension://  → 放行（我们自己的扩展，以及用户装的其他扩展）
+ *   其他（http/https/…）  → 拒绝，这是网页
+ *
+ * 想更严可以收窄到具体扩展 ID，但那样重装扩展就得改配置，
+ * 权衡后选择"允许扩展、拒绝网页"。
+ */
+function isTrustedOrigin(origin) {
+  if (origin === undefined || origin === null || origin === '') return true
+  const s = String(origin).toLowerCase()
+  if (s === 'null') return false
+  return s.startsWith('chrome-extension://')
+    || s.startsWith('moz-extension://')
+    || s.startsWith('safari-web-extension://')
+}
 
 async function loadWs() {
   const req = createRequire(join(PLUGIN_DIR, 'package.json'))
@@ -115,6 +141,9 @@ class Bridge {
     this.port = DEFAULT_PORT
     this.startedAt = 0
     this.lastError = null
+    // 调试通道 /rpc 的令牌：每次启动随机生成，只在状态里告诉本机调用方。
+    // 目的是让"从网页里盲目触发命令"变成不可能 —— 网页读不到这个值。
+    this.rpcToken = randomBytes(16).toString('hex')
   }
 
   get ready() {
@@ -163,13 +192,15 @@ class Bridge {
     // 每次读状态顺手清一次孤儿（代价极小），避免"旧的连接一直挂着"
     const reaped = this.reapOrphanSockets()
     if (reaped.length > 0) {
-      this.log.info(`[browser-bridge] 清理了 ${reaped.length} 条孤儿连接: ${reaped.map((r) => r.connId || r.reason).join(', ')}`)
+      this.log.info(`[session-bridge] 清理了 ${reaped.length} 条孤儿连接: ${reaped.map((r) => r.connId || r.reason).join(', ')}`)
     }
     return {
       ok: true,
       available: this.ready,
       wsUrl: `ws://${HOST}:${this.port}`,
       listening: Boolean(this.server && this.server.listening),
+      // /rpc 需要它；网页想读这个状态会被 CORS 挡住，只能本机 CLI 读
+      rpcToken: this.rpcToken,
       extensions: this.extCount(),
       extensionVersion: this.hello ? this.hello.version : null,
       browser: this.hello ? this.hello.browser : null,
@@ -208,7 +239,7 @@ class Bridge {
     if (!WebSocketServer) WebSocketServer = await loadWs()
     if (!WebSocketServer) {
       this.lastError = 'ws module not resolvable'
-      this.log.warn('[browser-bridge] 解析不到 ws 模块，桥不启动')
+      this.log.warn('[session-bridge] 解析不到 ws 模块，桥不启动')
       return
     }
     this.port = port || DEFAULT_PORT
@@ -218,11 +249,34 @@ class Bridge {
         res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(body)
       }
+      // ── 网页发起的 HTTP 请求一律拒绝 ──
+      // 浏览器的"简单请求"（GET / img / form）不带预检就能打到本地端口，
+      // CORS 只挡读响应、不挡执行，所以必须在服务端按 Origin 拦。
+      const reqOrigin = req.headers && req.headers.origin
+      if (!isTrustedOrigin(reqOrigin)) {
+        send(403, fail(E.badArgs, 'origin not allowed'))
+        return
+      }
+      // ── Host 必须是回环地址 ──
+      // 挡住 DNS rebinding：攻击者把 evil.com 解析到 127.0.0.1，网页里的
+      // fetch('http://evil.com:39401/') 就能读到状态（含 rpcToken）。
+      // 必须放在所有路由之前 —— 否则 GET / 这条会先把 token 吐出去。
+      const reqHost = String((req.headers && req.headers.host) || '')
+      if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqHost)) {
+        send(403, fail(E.badArgs, 'host not allowed'))
+        return
+      }
       // GET /            → 状态
-      // GET /rpc?cmd=…   → 调试用：把命令转发给扩展（仅本机回环可见）
+      // GET /rpc?cmd=…   → 调试用：把命令转发给扩展（本机 + 需 token）
       let u
       try { u = new URL(req.url || '/', `http://${HOST}:${this.port}`) } catch { u = null }
       if (u && u.pathname === '/rpc') {
+        // 调试通道要 token：状态接口里有它就无从下手
+        const given = u.searchParams.get('token') || ''
+        if (this.rpcToken && given !== this.rpcToken) {
+          send(401, fail(E.badArgs, 'bad or missing token'))
+          return
+        }
         const cmd = u.searchParams.get('cmd') || ''
         if (!cmd) { send(400, fail(E.badArgs, 'need ?cmd=')); return }
         let params = {}
@@ -243,9 +297,30 @@ class Bridge {
         this.request(cmd, params, opts).then((r) => send(r.ok ? 200 : 502, r))
         return
       }
-      send(200, this.status())
+      // 状态里带 rpcToken 会让 GET / 变成"token 分发器"——虽然 Host+Origin
+      // 已经挡住了网页，但没必要。改成：带对 token 才返回完整状态（含新 token），
+      // 否则去掉该字段。本机 CLI 自己知道 token（从进程内存/日志拿）。
+      const st = this.status()
+      if ((u && u.searchParams.get('token')) === this.rpcToken) {
+        // 完整状态
+      } else {
+        delete st.rpcToken
+      }
+      send(200, st)
     })
-    const wss = new WebSocketServer({ server: httpServer, path: '/', maxPayload: 64 * 1024 * 1024 })
+    const wss = new WebSocketServer({
+      server: httpServer,
+      path: '/',
+      maxPayload: 64 * 1024 * 1024,
+      // 拒绝网页发起的连接，只放行扩展与原生宿主（详见 isTrustedOrigin）
+      verifyClient: (info) => {
+        const origin = info && info.origin
+        if (isTrustedOrigin(origin)) return true
+        this.lastError = `拒绝来源不明的连接：Origin=${String(origin).slice(0, 60)}`
+        this.log.warn(`[session-bridge] 拒绝 WebSocket 连接，Origin=${String(origin).slice(0, 80)}`)
+        return false
+      },
+    })
     this.server = httpServer
 
     wss.on('connection', (sock, req) => this.onConnection(sock, req))
@@ -254,13 +329,13 @@ class Bridge {
     await new Promise((done) => {
       httpServer.once('error', (e) => {
         this.lastError = `listen failed: ${(e && e.message) || e}`
-        this.log.warn(`[browser-bridge] 监听 ${HOST}:${this.port} 失败: ${(e && e.message) || e}`)
+        this.log.warn(`[session-bridge] 监听 ${HOST}:${this.port} 失败: ${(e && e.message) || e}`)
         this.server = null
         done()
       })
       httpServer.listen(this.port, HOST, () => {
         this.startedAt = Date.now()
-        this.log.info(`[browser-bridge] WS 桥已就绪 ws://${HOST}:${this.port}`)
+        this.log.info(`[session-bridge] WS 桥已就绪 ws://${HOST}:${this.port}`)
         done()
       })
     })
@@ -558,7 +633,7 @@ class Bridge {
         this.primary = sock
       }
       sock.send(JSON.stringify({ type: 'hello-ack', version: '1.0.0' }) + '\n')
-      this.log.info(`[browser-bridge] 扩展已连接：${this.hello.browser} v${this.hello.version}`)
+      this.log.info(`[session-bridge] 扩展已连接：${this.hello.browser} v${this.hello.version}`)
       return
     }
     if (msg.type === 'pong' || msg.type === 'ping') {
@@ -605,7 +680,7 @@ class Bridge {
       // 超时的情况把当前 primary 也跳过，否则重试还是撞同一个
       const retry = await this._send(cmd, params, timeoutMs, opts.brand, opts.connId, dead)
       if (retry && retry.ok) {
-        this.log.warn(`[browser-bridge] ${cmd} 首次失败(${first.error})，已换连接重试成功`)
+        this.log.warn(`[session-bridge] ${cmd} 首次失败(${first.error})，已换连接重试成功`)
       }
       return retry
     }
@@ -1511,7 +1586,7 @@ async function attachImage(ctx, r) {
   }
   // 兜底：落盘，把路径给模型
   try {
-    const dir = join(tmpdir(), 'dsh-browser-bridge')
+    const dir = join(tmpdir(), 'dsh-session-bridge')
     mkdirSync(dir, { recursive: true })
     const file = join(dir, `shot-${Date.now()}.${mediaType === 'image/png' ? 'png' : 'jpg'}`)
     writeFileSync(file, parsed.bytes)
@@ -1617,14 +1692,14 @@ function registerTools(ctx, bridge) {
       // 但动态 import 换模块不会触发 fiber 的 dispose，所以要自己管）。
       if (typeof dispose === 'function') registeredToolDisposers.push(dispose)
     } catch (e) {
-      console.warn('[browser-bridge] register tool failed:', spec.name, e && e.message)
+      console.warn('[session-bridge] register tool failed:', spec.name, e && e.message)
     }
   }
 }
 
 function registerPrompt(ctx, bridge) {
   const section = {
-    name: 'browser-bridge',
+    name: 'session-bridge',
     // 排在 computer-use 之后（数字大 = 更靠后）。
     // 提示词里已经写明「浏览器操作优先 browser_*」，这里靠后不影响那条指令被看到。
     order: 5400,
@@ -1688,7 +1763,7 @@ export function apply(ctx, config = {}) {
   const port = clampInt(config && config.port, DEFAULT_PORT, 1024, 65535)
   Promise.resolve()
     .then(() => bridge.start(port))
-    .catch((e) => { bridge.lastError = String((e && e.message) || e); log.warn('[browser-bridge] start failed:', bridge.lastError) })
+    .catch((e) => { bridge.lastError = String((e && e.message) || e); log.warn('[session-bridge] start failed:', bridge.lastError) })
 
   if (ctx && typeof ctx.effect === 'function') {
     try { ctx.effect(() => () => bridge.stop()) } catch { /* ignore */ }

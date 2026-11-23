@@ -1,5 +1,5 @@
 /**
- * DSH Browser Bridge — MV3 service worker
+ * DSH Session Bridge — MV3 service worker
  *
  * 连接本机 DSH 插件的 WS 桥（127.0.0.1:39401），执行 browser_* 命令。
  * 全部能力都靠 chrome.scripting.executeScript 注入纯 JS 实现（不用 CDP），
@@ -22,7 +22,7 @@ const BRIDGE_PORTS = [39401]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.2.0'
+const EXT_VERSION = '2.3.0'
 const RECONNECT_MS = 2000
 const PING_MS = 20000
 // MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。
@@ -241,7 +241,7 @@ async function cmdLeaseList() {
  *
  * 桥侧把 brand=NativeHost 也当成一个"连接"来路由，所以两边都可用。
  */
-const NATIVE_HOST_NAME = 'com.dsh.bridge'
+const NATIVE_HOST_NAME = 'com.dsh.session'
 let nativePort = null
 let nativeReconnectTimer = null
 
@@ -1260,7 +1260,7 @@ async function applyThemeIcon(dark) {
   try {
     await chrome.action.setIcon({ path: iconPaths(dark) })
     await chrome.action.setTitle({
-      title: dark ? '大肥鱼 · DSH Browser Bridge（夜间模式）' : '大肥鱼 · DSH Browser Bridge（日间模式）',
+      title: dark ? '大肥鱼 · DSH Session Bridge（夜间模式）' : '大肥鱼 · DSH Session Bridge（日间模式）',
     })
     currentDarkIcon = dark
     return true

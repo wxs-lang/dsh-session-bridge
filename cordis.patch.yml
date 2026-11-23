@@ -1,4 +1,4 @@
-# dsh-browser-bridge — 挂载片段
+# dsh-session-bridge — 挂载片段
 #
 # 用法：把下面 `- insert:` 这一块合并进你 DSH profile 里的 cordis.patch.yml。
 #   DSH_HOME 默认是 ~/.dsh，profile 一般在：
@@ -19,8 +19,8 @@
 # 若被占用，在 config 里指定 port，并同步改 extension/background.js 的 BRIDGE_PORTS。
 
 - insert:
-    - id: dsh-browser-bridge
-      name: dsh-browser-bridge
+    - id: dsh-session-bridge
+      name: dsh-session-bridge
       inject: [ systemPrompt, tools ]
       config: {}
       # config 可选字段：

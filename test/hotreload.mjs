@@ -59,7 +59,7 @@ const ctx = {
 console.log('\n[1] 首次加载入口')
 const entryUrl = `file:///${plugin.replace(/\\/g, '/')}/index.js`
 const entry = await import(entryUrl)
-ok(entry.name === 'dsh-browser-bridge', '入口 name 正确', entry.name)
+ok(entry.name === 'dsh-session-bridge', '入口 name 正确', entry.name)
 ok(typeof entry.apply === 'function', '入口导出 apply')
 
 entry.apply(ctx, { port: 39429 })

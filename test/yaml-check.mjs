@@ -57,10 +57,10 @@ for (const file of targets) {
     console.log(`OK   ${file}`)
     console.log(`     entries=${Array.isArray(doc) ? doc.length : typeof doc}`)
     const mine = (Array.isArray(doc) ? doc : []).filter(
-      (e) => e && (e.id === 'dsh-browser-bridge'
-        || (Array.isArray(e.insert) && e.insert.some((x) => x.id === 'dsh-browser-bridge'))),
+      (e) => e && (e.id === 'dsh-session-bridge'
+        || (Array.isArray(e.insert) && e.insert.some((x) => x.id === 'dsh-session-bridge'))),
     )
-    console.log(`     browser-bridge 条目: ${mine.length} 个`)
+    console.log(`     session-bridge 条目: ${mine.length} 个`)
   } catch (e) {
     failed += 1
     console.log(`FAIL ${file}: ${e.message}`)

@@ -20,7 +20,7 @@ import { statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-export const name = 'dsh-browser-bridge'
+export const name = 'dsh-session-bridge'
 export const inject = ['systemPrompt', 'tools']
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -49,7 +49,7 @@ export function apply(ctx, config = {}) {
     // 把当前 ctx/config 交给实现
     mod.apply(ctx, config)
     current = mod
-    log.info(`[browser-bridge] 实现已加载 impl.js?t=${stamp}`)
+    log.info(`[session-bridge] 实现已加载 impl.js?t=${stamp}`)
     return mod
   }
 
@@ -77,6 +77,6 @@ export function apply(ctx, config = {}) {
   const p = load()
   // 启动失败不阻塞宿主
   Promise.resolve(p).catch((e) => {
-    log.warn('[browser-bridge] 加载 impl.js 失败：' + String((e && e.message) || e))
+    log.warn('[session-bridge] 加载 impl.js 失败：' + String((e && e.message) || e))
   })
 }

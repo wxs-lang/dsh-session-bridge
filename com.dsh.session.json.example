@@ -1,8 +1,8 @@
 {
   "type": "stdio",
-  "name": "com.dsh.bridge",
+  "name": "com.dsh.session",
   "description": "DSH Browser Bridge native messaging host",
-  "path": "<插件目录绝对路径>\\dsh-bridge-native.cmd",
+  "path": "<插件目录绝对路径>\\dsh-session-native.cmd",
   "allowed_origins": [
     "chrome-extension://<你的扩展ID>/"
   ]
