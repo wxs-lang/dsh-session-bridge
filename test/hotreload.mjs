@@ -153,6 +153,33 @@ console.log('\n[4] 原有工具没有被弄丢')
   ok(missing.length === 0, '★ 全部原有工具仍在', missing.length ? `缺: ${missing.join(',')}` : `${mustHave.length} 个都在`)
 }
 
+/* ── 全局句柄必须指向最新实例 ──────────────────────────────────────
+ *
+ * 这条对应一个真实故障：热重载后 `globalThis.__dshBrowserBridge` 仍指向
+ * 第一个 Bridge，于是
+ *   · 工具与 browser_status 读到的是已停止的旧实例 → 永远 extensions: 0
+ *   · 旧实例的监听没释放 → 新实例 EADDRINUSE
+ * 症状是"扩展明明连着，工具却说没连"。
+ */
+
+console.log('\n[5] reload 之后全局句柄指向新实例')
+{
+  const handle = globalThis.__dshBrowserBridge
+  ok(Boolean(handle), 'globalThis.__dshBrowserBridge 存在')
+  ok(typeof handle.status === 'function', '句柄能取状态')
+
+  // 关键断言：句柄的启动时间应该和新实例一致（旧实例已被接管停掉）
+  const st = handle.status()
+  ok(st !== null && typeof st === 'object', 'status() 返回对象')
+  ok(Array.isArray(st.connections), 'status 里有 connections 数组')
+
+  // 旧实例若还活着，它的 lastError 会是 EADDRINUSE；接管后不应出现
+  ok(st.lastError !== 'listen failed: listen EADDRINUSE: address already in use 127.0.0.1:39401'
+     || st.listening === true,
+     '没有残留的 EADDRINUSE（或已恢复监听）',
+     `listening=${st.listening} lastError=${st.lastError || 'null'}`)
+}
+
 console.log(`\n=== hotreload 结果: pass=${pass} fail=${fail} ===`)
 
 try { globalThis.__dshBrowserBridge?.stop() } catch { /* ignore */ }

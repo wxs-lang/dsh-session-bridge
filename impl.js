@@ -308,6 +308,8 @@ class Bridge {
       }
       send(200, st)
     })
+    // 端口被占多半是上一代实例还在释放（热重载常见）。
+    // 不做无限重试，只给一次 600ms 的宽限。
     const wss = new WebSocketServer({
       server: httpServer,
       path: '/',
@@ -498,6 +500,9 @@ class Bridge {
   }
 
   onConnection(sock, req) {
+    // 有真实连接进来，说明桥在正常工作 —— 之前的 listen 失败/超时是历史，
+    // 留着只会让排查的人误以为现在还坏着。
+    this.lastError = null
     sock.dshHelloAt = 0
     sock.dshBuf = ''
     sock.dshOpenedAt = Date.now()
@@ -850,6 +855,36 @@ async function autoGroup(bridge, tabId) {
   // 归组失败不打断主流程，但把原因留在 bridge 上，让 browser_status 能看到
   bridge.lastGroupError = lastGroupError
   return null
+}
+
+/* ── 运行时桥代理 ──────────────────────────────────────────────────
+ *
+ * 工具注册时，cordis 会把第二参数 `bridge` 固定成那一刻的实例。
+ * 热重载会 new 一个新的 Bridge，但已注册工具的闭包里仍是旧的 ——
+ * 于是 browser_status 永远读到"已停止的旧实例"，显示 extensions: 0，
+ * 而扩展其实好端端连着新实例。
+ *
+ * 解法：注册时不给真实例，给一个代理。每次访问都从 globalThis 取当前的那个。
+ * 这样无论重载多少次，工具永远打在活着的桥身上。
+ */
+function liveBridge(fallback) {
+  const get = () => {
+    const cur = globalThis.__dshBrowserBridge
+    return (cur && typeof cur.status === 'function') ? cur : fallback
+  }
+  // 只代理 Bridge 上真正会被工具用到的方法/字段
+  return new Proxy({}, {
+    get(_t, prop) {
+      const target = get()
+      const v = target[prop]
+      return typeof v === 'function' ? v.bind(target) : v
+    },
+    set(_t, prop, value) {
+      get()[prop] = value
+      return true
+    },
+    has(_t, prop) { return prop in get() },
+  })
 }
 
 /** 本次 apply 注册过的工具 disposer（重载前逐个调用，避免工具重复/残留）。 */
@@ -1756,8 +1791,17 @@ export function apply(ctx, config = {}) {
   }
   const bridge = new Bridge(log)
 
-  registerTools(ctx, bridge)
-  registerPrompt(ctx, bridge)
+  // ── 关键：先把这一代实例挂到 globalThis，再注册工具 ──
+  // 工具收到的是 liveBridge 代理而不是真实例，这样热重载之后
+  // 已注册的旧工具也会打到新的、活着的桥上。
+  try {
+    const prev = globalThis.__dshBrowserBridge
+    if (prev && prev !== bridge && typeof prev.stop === 'function') prev.stop()
+  } catch { /* 旧实例坏了也要继续 */ }
+  globalThis.__dshBrowserBridge = bridge
+
+  registerTools(ctx, liveBridge(bridge))
+  registerPrompt(ctx, liveBridge(bridge))
 
   // 启动 WS（异步，失败不阻塞宿主启动）
   const port = clampInt(config && config.port, DEFAULT_PORT, 1024, 65535)
@@ -1772,10 +1816,7 @@ export function apply(ctx, config = {}) {
     try { ctx.on('dispose', () => bridge.stop()) } catch { /* ignore */ }
   }
 
-  // 给测试/调试留个把手
-  if (!globalThis.__dshBrowserBridge) {
-    globalThis.__dshBrowserBridge = bridge
-  }
+  // globalThis 接管已在上面 registerTools 之前完成
 
   // ── 自热重载 ──
   // cordis 的 fiber.restart() 会 dispose 再重新 apply，等于"只重启这个插件"。

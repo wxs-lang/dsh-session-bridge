@@ -22,7 +22,7 @@ const BRIDGE_PORTS = [39401]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.3.0'
+const EXT_VERSION = '2.3.1'
 const RECONNECT_MS = 2000
 const PING_MS = 20000
 // MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。

@@ -61,18 +61,32 @@ export function apply(ctx, config = {}) {
     const url = new URL(`./impl.js?t=${s2}-${Date.now()}`, import.meta.url).href
     const mod = await import(url)
     if (!mod || typeof mod.apply !== 'function') throw new Error('impl.js 没有导出 apply()')
-    // 先让旧实现释放（它自己用 ctx.effect 挂的 dispose 会处理 Bridge.stop）
+
+    // ── 必须先停旧实例，再 apply 新的 ──
+    // 否则旧 Bridge 的 http server 还占着 39401，新实例 start() 撞
+    // EADDRINUSE，于是所有工具绑在一个"启动失败"的空桥上：
+    // 扩展明明连着，browser_status 却报 extensions: 0。
+    //
+    // 端口释放是异步的（close 回调），所以停完等一小会儿再起。
+    try {
+      const prev = globalThis.__dshBrowserBridge
+      if (prev && typeof prev.stop === 'function') {
+        prev.stop()
+        await new Promise((r) => setTimeout(r, 300))
+      }
+    } catch { /* 旧实例坏了也要继续 */ }
+
     mod.apply(ctx, config)
     current = mod
     return { ok: true, stamp: s2 }
   }
 
-  if (!globalThis.__dshBrowserBridgeReloadImpl) {
-    globalThis.__dshBrowserBridgeReloadImpl = reload
-  }
-  if (!globalThis.__dshBrowserBridgeEntry) {
-    globalThis.__dshBrowserBridgeEntry = { get impl() { return current }, apply, reload }
-  }
+  // 每次都覆盖，不要写成 if (!globalThis.__x)。
+  // 写 if 的话，第一代设置的闭包会永久钉住第一代的 ctx/config/stamp，
+  // 之后无论 apply 多少次，browser_reload 调的都还是那个老闭包 ——
+  // 改 index.js 完全不生效，只能重启 DSH。
+  globalThis.__dshBrowserBridgeReloadImpl = reload
+  globalThis.__dshBrowserBridgeEntry = { get impl() { return current }, apply, reload }
 
   const p = load()
   // 启动失败不阻塞宿主

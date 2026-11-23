@@ -4,6 +4,64 @@
 
 ---
 
+## [2.3.1] — 2026-11-23
+
+修一个「扩展明明连着，工具却说没连」的故障。
+
+### 修复
+
+**热重载后工具绑在已停止的旧桥上**
+
+症状：`browser_status` 返回 `listening: false, extensions: 0`，`lastError` 是
+`EADDRINUSE`；但直接 `curl http://127.0.0.1:39401/` 却看到
+`listening: true, extensions: 3`。
+
+两个来源看的是**不同的对象**：端口上是活的桥，工具读的是死的那一代。
+
+三个成因叠在一起：
+
+1. **`globalThis` 只在第一代赋值**
+   ```js
+   if (!globalThis.__dshBrowserBridge) {
+     globalThis.__dshBrowserBridge = bridge   // ← 之后的 apply 再也不覆盖
+   }
+   ```
+   后续每次重载都新建了 Bridge，但全局句柄还指着第一个。
+
+2. **工具拿到的是注册时的实例**
+   `ctx.tools.register({ execute(args) { ... spec.run(a, scoped(a), ctx) } })`
+   里的 `scoped(a)` 闭包捕获了注册那一刻的 `bridge`。即使 `globalThis`
+   更新了，已注册的工具还是打在旧实例上。
+
+3. **`reload()` 没停旧实例**
+   `index.js` 的 reload 直接 `mod.apply(ctx, config)`，旧的 http server
+   还占着 39401，新实例 `start()` 撞 `EADDRINUSE` 失败 ——
+   于是新实例是个「启动失败的空壳」，正好被新的 `globalThis` 指到。
+
+三者串起来就是那个现象。
+
+**修法**：
+
+- `apply()` 里先停上一代实例，再**无条件**覆盖 `globalThis`
+- 工具注册时传一个 `liveBridge()` 代理，每次属性访问都从 `globalThis`
+  取当前实例 —— 这样无论重载多少次，工具永远打在活着的桥上
+- `index.js` 的 `reload()` 先 `stop()` 旧实例、等 300ms 让端口释放，再 apply
+- `globalThis.__dshBrowserBridgeReloadImpl` 改成每次 apply 都覆盖
+  （原来用 `if (!...)` 保护，导致永久钉住第一代的闭包）
+- `onConnection` 清空 `lastError` —— 有真实连接进来就说明桥在正常工作，
+  留着历史错误只会误导排查
+
+### 新增测试
+
+- `test/handover.mjs`（9 项）—— 完整复现「连续两代 apply」场景：
+  第一代监听 → reload → 断言 `globalThis` 已换、端口已释放、新实例监听成功、
+  工具读到的是活的桥、端口能接受扩展连接
+- `test/hotreload.mjs` 增加「reload 之后全局句柄指向新实例」一组断言
+
+总测试 114 → **128 项**。
+
+---
+
 ## [2.3.0] — 2026-11-23
 
 改名 + 安全加固 + 一键安装。

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-bridge",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "把你自己已登录的浏览器变成 DSH 的 browser_* 工具：不新开实例、不抢焦点、多浏览器并存，所有操作都在后台完成。",
   "type": "module",
   "main": "index.js",
