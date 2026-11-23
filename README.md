@@ -147,7 +147,7 @@ reg add "HKCU\Software\Tencent\QQBrowser\NativeMessagingHosts\com.dsh.session" /
 browser_status
 → {
     "extensions": 2,
-    "extensionVersion": "2.2.0",
+    "extensionVersion": "2.3.1",
     "connections": [
       { "brand": "Chrome",     "commands": 29, "windows": [290992688] },
       { "brand": "NativeHost", "commands": 30 }
