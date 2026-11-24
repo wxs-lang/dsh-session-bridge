@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "大肥鱼 · DSH Session Bridge",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "description": "让 DSH 在你已登录的浏览器里后台干活：点击、输入、截图、开关标签，全程不抢焦点。",
   "minimum_chrome_version": "116",
   "permissions": [

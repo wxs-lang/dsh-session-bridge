@@ -1336,7 +1336,9 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
 
   {
     name: 'browser_navigate',
-    description: `在用户浏览器里打开一个 URL。newTab=true 新建标签页（默认），否则复用指定 tabId 的标签页；导航完成后返回页面快照（title / url / 元素）。**默认后台打开，不切换你的当前标签页、不抢焦点**（要前台就给 active=true）。复用已登录会话时用它替代 web_fetch。${WHEN}`,
+    description: `在用户浏览器里打开一个 URL。newTab=true 新建标签页（默认），否则复用指定 tabId 的标签页；导航完成后返回页面快照（title / url / 元素）。**默认后台打开，不切换你的当前标签页、不抢焦点**（要前台就给 active=true）。复用已登录会话时用它替代 web_fetch。
+
+新开的标签会登记到隐式租约，**默认 10 分钟后自动关闭**，避免标签越堆越多占内存；想长期留着这一页就传 keepAlive=true，或用 leaseTtlMs 调整时长（1 分钟~1 小时）。${WHEN}`,
     parameters: {
       type: 'object',
       properties: {
@@ -1349,6 +1351,15 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         newTab: { type: 'boolean', description: '是否新开标签页，默认 true' },
         active: { type: 'boolean', description: '新标签页是否切到前台。默认 false（后台打开，不动你的焦点）' },
         waitMs: { type: 'number', description: '导航后额外等待毫秒数（等前端渲染），默认 600' },
+        keepAlive: {
+          type: 'boolean',
+          description: '是否长期保留这个标签页。默认 false —— 插件新开的标签会登记到隐式租约，'
+            + '到期（默认 10 分钟）自动关闭，避免越堆越多占内存。想留着就传 true。',
+        },
+        leaseTtlMs: {
+          type: 'number',
+          description: '隐式租约时长（毫秒），默认 600000（10 分钟），范围 1 分钟~1 小时',
+        },
       },
       required: [],
       additionalProperties: false,
@@ -1379,6 +1390,10 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         newTab: args.newTab !== false,
         active: args.active === true,
         waitMs: clampInt(args.waitMs, 600, 0, 10000),
+        // 新开的标签默认纳入隐式租约，到期自动关，避免越堆越多。
+        // keepAlive=true 豁免；leaseTtlMs 可调时长（1 分钟~1 小时）。
+        keepAlive: args.keepAlive === true,
+        leaseTtlMs: clampInt(args.leaseTtlMs, 600000, 60000, 3600000),
       }, { timeoutMs: 40000 })
       if (r && r.ok) await autoGroup(bridge, r.tabId ?? args.tabId)
       return r

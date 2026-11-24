@@ -22,12 +22,13 @@ const BRIDGE_PORTS = [39401]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.3.1'
+const EXT_VERSION = '2.3.2'
 const RECONNECT_MS = 2000
 const PING_MS = 20000
 // MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。
 // 用 alarm 定期把 SW 叫醒重连，保证 DSH 随时能连上（代价是 SW 每分钟醒一次）。
 const KEEPALIVE_ALARM = 'dsh-bridge-keepalive'
+const LEASE_ALARM = 'dsh-bridge-lease-reap'
 const KEEPALIVE_MINUTES = 1
 
 /** port -> { ws, connectedAt, reconnectTimer, pingTimer, helloSent } */
@@ -141,12 +142,47 @@ const DEFAULT_LEASE_TTL_MS = 10 * 60 * 1000
 
 let leaseSeq = 0
 
+/* ── 隐式租约：插件新建的标签自动纳入清理 ──
+ *
+ * 调用方不必先 browser_lease 开一个。只要标签是插件自己开的（tab.navigate
+ * 走了 chrome.tabs.create），就登记到 '__auto__' 名下，到期自动关。
+ *
+ * 用户自己开的标签永远不会进来 —— 只有 chrome.tabs.create 返回的 id 才会
+ * 走到 trackAutoTab()。
+ */
+const AUTO_LEASE_ID = '__auto__'
+
+function autoLease() {
+  let l = leases.get(AUTO_LEASE_ID)
+  if (!l) {
+    l = {
+      tabs: new Set(),
+      groups: new Set(),
+      createdAt: Date.now(),
+      deadline: Date.now() + DEFAULT_LEASE_TTL_MS,
+      keepTabs: false,
+    }
+    leases.set(AUTO_LEASE_ID, l)
+  }
+  return l
+}
+
+/** 登记一个插件新建的标签，并顺延隐式租约的到期时间。 */
+function trackAutoTab(tabId, ttlMs) {
+  if (typeof tabId !== 'number') return
+  const l = autoLease()
+  l.tabs.add(tabId)
+  const ttl = Math.min(60 * 60 * 1000, Math.max(60000, Number(ttlMs) || DEFAULT_LEASE_TTL_MS))
+  l.deadline = Date.now() + ttl
+}
+
 function newLease(opts = {}) {
   const ttl = Math.min(60 * 60 * 1000, Math.max(5000, Number(opts.ttlMs) || DEFAULT_LEASE_TTL_MS))
   const id = `L${++leaseSeq}-${Date.now().toString(36)}`
   leases.set(id, {
     tabs: new Set(),
     groups: new Set(),
+    createdAt: Date.now(),
     deadline: Date.now() + ttl,
     keepTabs: opts.keepTabs === true,
   })
@@ -170,6 +206,33 @@ function attachToLease(id, { tabIds, groupIds } = {}) {
   return true
 }
 
+/**
+ * 扫一遍所有租约，把过期的清掉。
+ *
+ * 由 chrome.alarms 每 LEASE_REAP_MS 触发。MV3 的 Service Worker 会被浏览器
+ * 卸载，setInterval 随之停摆 —— 只有 alarm 能在 SW 休眠时把它叫醒。
+ *
+ * 清理时只关租约登记的 tab / group，用户自己开的标签一律不动。
+ */
+async function reapExpiredLeases() {
+  const now = Date.now()
+  const expired = []
+  for (const [id, l] of leases) {
+    if (l.deadline <= now) expired.push(id)
+  }
+  const closed = []
+  for (const id of expired) {
+    try {
+      const r = await releaseLease(id)
+      if (r && r.ok) closed.push({ leaseId: id, tabs: r.closedTabs.length, groups: r.closedGroups.length })
+    } catch { /* 单个租约清理失败不影响其他 */ }
+  }
+  if (closed.length > 0) {
+    try { console.log('[bridge] 自动清理过期租约:', JSON.stringify(closed)) } catch { /* ignore */ }
+  }
+  return closed
+}
+
 /** 释放租约：关掉它名下"本次新建"的标签和分组。 */
 async function releaseLease(id, opts = {}) {
   const l = leases.get(id)
@@ -182,6 +245,8 @@ async function releaseLease(id, opts = {}) {
     for (const tid of l.tabs) {
       try {
         const t = await chrome.tabs.get(tid)
+        // 只关掉仍然存在的。标签已经不在（用户自己关了 / 浏览器回收）就跳过。
+        // 这里的集合 l.tabs 只包含调用方显式登记过的标签，不会误伤用户原有页面。
         if (t) { await chrome.tabs.remove(tid); closedTabs.push(tid) }
       } catch { /* 已经关了 */ }
     }
@@ -195,6 +260,8 @@ async function releaseLease(id, opts = {}) {
       }
     } catch { /* 组已消失 */ }
   }
+  l.tabs.clear()
+  l.groups.clear()
   return { ok: true, leaseId: id, closedTabs, closedGroups }
 }
 
@@ -457,11 +524,41 @@ function bridgeError(code, message) {
 
 /* ── 公共辅助 ───────────────────────────────────────────────────────── */
 
+/**
+ * 被浏览器回收（discarded）的标签页要先唤醒才能操作。
+ *
+ * 浏览器会在内存紧张或标签久置后台时把标签的渲染进程丢掉 —— 标签还在标签栏上，
+ * 但内容已经卸载，往里注入脚本必然失败，CDP 也会报 "Not attached to an active page"。
+ *
+ * 唤醒方式：chrome.tabs.reload()。它是**后台重载**，不会把标签切到前台，
+ * 所以不会抢用户焦点。重载完成前不阻塞：给一段短等待，够多数页面起来即可，
+ * 剩下的交给后续的 waitForLoad。
+ */
+async function wakeIfDiscarded(tab, waitMs = 1200) {
+  if (!tab || !tab.discarded) return tab
+  try {
+    await chrome.tabs.reload(tab.id, { bypassCache: false })
+  } catch { /* 重载失败就原样返回，让调用方走错误路径 */ }
+  // 等它 status 变成 complete，但不死等
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    if (Date.now() > deadline) break
+    try {
+      const fresh = await chrome.tabs.get(tab.id)
+      if (!fresh.discarded && fresh.status === 'complete') return fresh
+    } catch { break }
+    await sleep(150)
+  }
+  try { return await chrome.tabs.get(tab.id) } catch { return tab }
+}
+
 async function resolveTab(tabId, preferActive = true) {
   if (typeof tabId === 'number' && Number.isFinite(tabId)) {
     let tab
   try { tab = await chrome.tabs.get(tabId) } catch { tab = null }
     if (!tab) throw bridgeError('tab_not_found', `标签页 ${tabId} 不存在（可能已关闭）`)
+    // 被浏览器丢了渲染进程 —— 先静默唤醒，否则后续注入/CDP 必然失败
+    if (tab.discarded) tab = await wakeIfDiscarded(tab)
     return tab
   }
   const tabs = await chrome.tabs.query(preferActive ? { active: true, lastFocusedWindow: true } : {})
@@ -1592,6 +1689,9 @@ async function cmdTabNavigate(params) {
       active: params.active === true,   // 默认后台打开，不抢焦点
       windowId: cur.length > 0 ? cur[0].windowId : undefined,
     })
+    // 插件自己开的标签登记到隐式租约 —— 到期自动关，不占内存。
+    // params.keepAlive === true 可豁免（调用方想长期留着这页）。
+    if (params.keepAlive !== true) trackAutoTab(tab && tab.id, params.leaseTtlMs)
   }
 
   // ── 立刻归组：不等加载完。
@@ -2209,8 +2309,8 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-async function waitForLoad(tabId, waitMs) {
-  const deadline = Date.now() + 20000
+async function waitForLoad(tabId, waitMs, maxWaitMs = 10000) {
+  const deadline = Date.now() + Math.max(1000, Number(maxWaitMs) || 10000)
   // 等 status 从 loading 变 complete（最多 20s），再额外等 waitMs 给前端渲染
   let settled = false
   while (Date.now() < deadline) {
@@ -2257,15 +2357,11 @@ ensureKeepAlive()
  * 必须用 chrome.alarms 而不是 setInterval：MV3 的 Service Worker 会在闲置
  * 约 30s 后被浏览器卸载，setInterval 随之消失（实测"到期不回收"就是这个原因）。
  * alarms 由浏览器托管，SW 睡着也会在到点时把它唤醒。 */
-const LEASE_ALARM = 'dsh-bridge-lease-reap'
 try {
   chrome.alarms.create(LEASE_ALARM, { periodInMinutes: 0.5 })
   chrome.alarms.onAlarm.addListener((a) => {
     if (!a || a.name !== LEASE_ALARM) return
-    const now = Date.now()
-    for (const [id, l] of [...leases]) {
-      if (l.deadline <= now) releaseLease(id).catch(() => { /* ignore */ })
-    }
+    reapExpiredLeases().catch(() => { /* ignore */ })
   })
 } catch { /* 没有 alarms 权限就退化成只在 release 时清理 */ }
 
