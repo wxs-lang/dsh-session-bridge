@@ -52,6 +52,8 @@ function pickExtDir() {
 const EXT_DIR = pickExtDir()
 const HOST = '127.0.0.1'
 const DEFAULT_PORT = 39401
+/** 首选端口被占用时依次尝试。扩展侧 BRIDGE_PORTS 必须包含同样的列表。 */
+const FALLBACK_PORTS = [39411, 39421]
 const DEFAULT_TIMEOUT = 20000
 
 /* ── 依赖解析：ws ─────────────────────────────────────────────────────
@@ -144,6 +146,10 @@ class Bridge {
     // 调试通道 /rpc 的令牌：每次启动随机生成，只在状态里告诉本机调用方。
     // 目的是让"从网页里盲目触发命令"变成不可能 —— 网页读不到这个值。
     this.rpcToken = randomBytes(16).toString('hex')
+    // 原生宿主的握手令牌：写到临时文件，宿主读它并在 URL 里回传。
+    // 读不到文件的旧宿主会传空串，桥侧对此放行（见 onConnection）。
+    this.nativeToken = randomBytes(16).toString('hex')
+    this.nativeTokenPath = join(tmpdir(), 'dsh-session-bridge.token')
   }
 
   get ready() {
@@ -328,19 +334,47 @@ class Bridge {
     wss.on('connection', (sock, req) => this.onConnection(sock, req))
     wss.on('error', (e) => { this.lastError = String((e && e.message) || e) })
 
-    await new Promise((done) => {
-      httpServer.once('error', (e) => {
-        this.lastError = `listen failed: ${(e && e.message) || e}`
-        this.log.warn(`[session-bridge] 监听 ${HOST}:${this.port} 失败: ${(e && e.message) || e}`)
-        this.server = null
-        done()
+    // ── 监听：首选端口被占就依次降级 ──
+    // 两个 DSH 实例同时跑时，第二个会撞 EADDRINUSE。原来直接失败，
+    // 表现为"桥起不来、扩展连不上"。现在降级到备用端口，功能照常。
+    const candidates = [this.port]
+    for (const p of FALLBACK_PORTS) if (!candidates.includes(p)) candidates.push(p)
+
+    let listenErr = null
+    for (const candidate of candidates) {
+      const ok = await new Promise((done) => {
+        const onErr = (e) => {
+          listenErr = e
+          httpServer.removeListener('error', onErr)
+          done(false)
+        }
+        httpServer.once('error', onErr)
+        httpServer.listen(candidate, HOST, () => {
+          httpServer.removeListener('error', onErr)
+          this.port = candidate
+          this.startedAt = Date.now()
+          done(true)
+        })
       })
-      httpServer.listen(this.port, HOST, () => {
-        this.startedAt = Date.now()
+      if (ok) {
+        this.lastError = null
+        // 写握手令牌供原生宿主读取。写失败不影响功能（宿主会传空串）。
+        try {
+          writeFileSync(this.nativeTokenPath, this.nativeToken, { mode: 0o600 })
+        } catch (e) {
+          this.log.warn('[session-bridge] 写 native token 失败（原生宿主将不做校验）: ' + ((e && e.message) || e))
+        }
         this.log.info(`[session-bridge] WS 桥已就绪 ws://${HOST}:${this.port}`)
-        done()
-      })
-    })
+        return
+      }
+      this.log.warn(`[session-bridge] 端口 ${candidate} 不可用：${(listenErr && listenErr.message) || listenErr}`)
+    }
+
+    // 全部失败
+    this.lastError = `所有端口都监听失败（试过 ${candidates.join(', ')}）：`
+      + `${(listenErr && listenErr.message) || listenErr}`
+    this.log.warn('[session-bridge] ' + this.lastError)
+    this.server = null
   }
 
   /** 关掉指定的连接（按 connId）。 */
@@ -518,6 +552,20 @@ class Bridge {
       if (brand) sock.dshBrand = String(brand)
       if (ver) sock.dshVersion = String(ver)
       if (pid) sock.dshPid = Number(pid) || null
+
+      // ── 原生宿主必须带对握手令牌 ──
+      // 无 Origin 虽然挡住了网页，但挡不住"本机任意进程自称 NativeHost"。
+      // 令牌从桥写出的临时文件里读，抬高门槛。
+      // 传空串的情况放行：旧宿主 / 文件读不到，不能让功能因此坏掉。
+      if (String(brand || '').toLowerCase() === 'nativehost') {
+        const given = String(u.searchParams.get('token') || '')
+        if (given && this.nativeToken && given !== this.nativeToken) {
+          sock.dshBrand = 'Rejected'
+          this.lastError = 'NativeHost 令牌不匹配，已拒绝'
+          try { sock.close(1008, 'bad native token') } catch { /* ignore */ }
+          return
+        }
+      }
 
       // ── connId 必须能区分"同一品牌的多个实例" ──
       // 浏览器扩展用窗口指纹（windows=1-2-3）；

@@ -14,7 +14,9 @@
 // 只连主端口。原来连 3 个端口是为了"多开桥时也能连上"，
 // 但代价是 3 份 WebSocket + 3 倍 ping 唤醒，SW 常驻更重。
 // 需要备用口时手动加回来（并同步改 index.js 的 DEFAULT_PORT / 测试端口）。
-const BRIDGE_PORTS = [39401]
+// 桥的候选端口。桥在首选端口被占时会降级到后面的（见 impl.js 的 FALLBACK_PORTS），
+// 扩展要跟着连，否则桥起来了却没人接。
+const BRIDGE_PORTS = [39401, 39411, 39421]
 
 /** 允许连桥的浏览器品牌白名单。
  *  QQ浏览器/360/搜狗 会加载同一扩展目录，两边都连桥 → 命令随机落一边，
@@ -22,7 +24,7 @@ const BRIDGE_PORTS = [39401]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.3.2'
+const EXT_VERSION = '2.3.3'
 const RECONNECT_MS = 2000
 const PING_MS = 20000
 // MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。
@@ -32,6 +34,24 @@ const LEASE_ALARM = 'dsh-bridge-lease-reap'
 const KEEPALIVE_MINUTES = 1
 
 /** port -> { ws, connectedAt, reconnectTimer, pingTimer, helloSent } */
+/* ── 错误记录 ──────────────────────────────────────────────────────────
+ *
+ * 空 catch 在扩展里很常见 —— finally 里 detach 失败没人能补救，
+ * 记下来反而会盖住真实错误。但**用户操作失败**被吞掉就麻烦了：
+ * 表现是"点了没反应，也不知道为什么"。
+ *
+ * noteErr 只用于后一种：记进环形缓冲，通过 debug.info 命令能取出来。
+ */
+const ERR_LOG = []
+const ERR_LOG_MAX = 50
+
+function noteErr(where, e) {
+  const msg = String((e && e.message) || e || 'unknown')
+  ERR_LOG.push({ t: Date.now(), where, msg: msg.slice(0, 200) })
+  if (ERR_LOG.length > ERR_LOG_MAX) ERR_LOG.shift()
+  try { console.warn(`[bridge] ${where}: ${msg}`) } catch { /* ignore */ }
+}
+
 const links = new Map()
 const inflight = new Map() // id -> { startedAt, cmd, port }
 
@@ -538,7 +558,7 @@ async function wakeIfDiscarded(tab, waitMs = 1200) {
   if (!tab || !tab.discarded) return tab
   try {
     await chrome.tabs.reload(tab.id, { bypassCache: false })
-  } catch { /* 重载失败就原样返回，让调用方走错误路径 */ }
+  } catch (e) { noteErr('wakeIfDiscarded', e) }
   // 等它 status 变成 complete，但不死等
   const deadline = Date.now() + waitMs
   for (;;) {
@@ -696,7 +716,7 @@ async function cdpScroll(tabId, x, y, deltaX, deltaY) {
       })
     })
     viaCdp = true
-  } catch { /* CDP 失败就只走 DOM 兜底 */ }
+  } catch (e) { noteErr('input.cdp', e) }
 
   // ── DOM 兜底 ──
   // 实测某些 Chrome 版本/页面上 Input.dispatchMouseEvent(type:'mouseWheel')
@@ -1705,7 +1725,7 @@ async function cmdTabNavigate(params) {
         color: params.groupColor,
         collapsed: params.collapsed,
       })
-    } catch { /* 归组失败不影响导航 */ }
+    } catch (e) { noteErr('autoGroup', e) }
   }
 
   // 兜底：chrome.tabs.create 偶发返回没有 id 的对象（实测约 20% 概率，
@@ -1912,7 +1932,7 @@ async function cmdTabEval(params) {
       if (now.url && now.url !== beforeUrl && now.status === 'complete') break
     }
     let fresh = tab
-    try { fresh = await chrome.tabs.get(tab.id) } catch { /* ignore */ }
+    try { fresh = await chrome.tabs.get(tab.id) } catch (e) { noteErr('screenshot.getTab', e) }
     return {
       ok: true, tabId: tab.id, navigated: true,
       url: fresh.url || '', title: fresh.title || '',
@@ -2088,7 +2108,15 @@ async function cmdDebugInfo() {
     return { ok: false, error: String((e && e.message) || e) }
   }
   const attached = targets.filter((t) => t.attached)
-  return { ok: true, total: targets.length, attachedCount: attached.length, attached, targets: targets.slice(0, 20) }
+  return {
+    ok: true,
+    total: targets.length,
+    attachedCount: attached.length,
+    attached,
+    targets: targets.slice(0, 20),
+    // 最近的用户操作失败记录（noteErr 收集）。排查"点了没反应"时看这里。
+    recentErrors: ERR_LOG.slice(-20),
+  }
 }
 
 /** 强制 detach 所有调试会话（清理"相机角标"用）。 */

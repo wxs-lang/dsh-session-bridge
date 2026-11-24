@@ -23,6 +23,26 @@ const require = createRequire(import.meta.url)
 const { WebSocket } = require('ws')
 
 const PORT = Number(process.env.DSH_BRIDGE_PORT || 39401)
+
+/* ── 桥的握手令牌 ──
+ *
+ * 桥在启动时把随机 token 写到 <tmpdir>/dsh-session-bridge.token，
+ * 宿主启动时读它并回传。目的是让"随便哪个本地进程连上 39401 自称 NativeHost"
+ * 这件事多一道门槛 —— 它至少得知道文件在哪。
+ *
+ * 读不到就返回空串，桥侧对此是放行的（不能让文件权限问题把功能弄坏）。
+ */
+function readBridgeToken() {
+  try {
+    const { readFileSync } = require('node:fs')
+    const { join } = require('node:path')
+    const { tmpdir } = require('node:os')
+    const p = join(tmpdir(), 'dsh-session-bridge.token')
+    return readFileSync(p, 'utf8').trim().slice(0, 128)
+  } catch {
+    return ''
+  }
+}
 const HOST = '127.0.0.1'
 
 /* ── stdout 写入：4 字节 LE 长度 + JSON ─────────────────────────────── */
@@ -84,6 +104,8 @@ function wsConnect() {
       ver: 'native',
       pid: String(process.pid),
       ppid: String(process.ppid || 0),
+      // 桥侧据此确认"这是我写出去的那个 token"
+      token: readBridgeToken(),
     })
     ws = new WebSocket(`ws://${HOST}:${PORT}/?${qs.toString()}`)
   } catch (e) {
