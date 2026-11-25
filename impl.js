@@ -905,6 +905,55 @@ async function autoGroup(bridge, tabId) {
   return null
 }
 
+/* ── 快照绑定：防止在已导航的页面上用旧 ref 点错位置 ────────────────
+ *
+ * ref（如 e12）是页面级的，跨页面没有意义。如果：
+ *   ① 在 A 页取了快照（e1 = 保存按钮）
+ *   ② 页面导航到 B（或者 tabId 传错落到别的页）
+ *   ③ 点击 e1
+ * 而 B 页恰好也有 e1，就会在完全无关的位置点下去 —— 不报错，静默误操作。
+ *
+ * 所以记下每个 tabId 最后一次快照的 url，操作前比对。
+ */
+const snapshots = new Map()   // tabId -> { url, at }
+
+function rememberSnapshot(tabId, url) {
+  if (typeof tabId !== 'number') return
+  snapshots.set(tabId, { url: String(url || ''), at: Date.now() })
+}
+
+/** 校验 ref 是否还能用在这个 tabId 上。返回 null 表示通过，否则返回错误对象。 */
+function checkSnapshotFresh(tabId, bridge) {
+  if (typeof tabId !== 'number') return null
+  const snap = snapshots.get(tabId)
+  if (!snap) return null   // 没取过快照 → 不拦（坐标模式等场景不需要）
+  // 超过 10 分钟的旧快照一律要求重取
+  if (Date.now() - snap.at > 10 * 60 * 1000) {
+    snapshots.delete(tabId)
+    return fail(E.badArgs,
+      `tabId=${tabId} 的快照已超过 10 分钟，ref 可能已失效。请重新调 browser_snapshot。`)
+  }
+  return null
+}
+
+/** 异步版：拉当前 url 与快照时比对。 */
+async function verifySnapshotUrl(tabId, bridge) {
+  if (typeof tabId !== 'number') return null
+  const snap = snapshots.get(tabId)
+  if (!snap || !snap.url) return null
+  try {
+    const r = await bridge.request('tab.info', { tabId }, { timeoutMs: 8000 })
+    if (!r || !r.ok) return null   // 拿不到就放行，不阻塞主流程
+    const now = String(r.url || '')
+    if (now && snap.url && now !== snap.url) {
+      return fail(E.badArgs,
+        `ref 已失效：快照时页面是 ${snap.url.slice(0, 80)}，`
+        + `现在是 ${now.slice(0, 80)}。请重新调 browser_snapshot 取新 ref。`)
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
 /* ── 运行时桥代理 ──────────────────────────────────────────────────
  *
  * 工具注册时，cordis 会把第二参数 `bridge` 固定成那一刻的实例。
@@ -1092,7 +1141,7 @@ const TOOL_SPECS = [
         maxElements: { type: 'number', description: '元素上限，默认 120，最大 400' },
         selector: { type: 'string', description: '只看某个容器内的元素，CSS 选择器，如 "#login-form"' },
       },
-      required: [],
+      required: ['tabId'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1102,7 +1151,11 @@ const TOOL_SPECS = [
         maxElements: clampInt(args.maxElements, 120, 1, 400),
         selector: args.selector,
       }, { timeoutMs: 45000 })
-      if (r && r.ok) await autoGroup(bridge, r.tabId)
+      if (r && r.ok) {
+        // 记下这次快照对应哪个页面 —— 后续用 ref 操作前要校验
+        rememberSnapshot(r.tabId, r.url)
+        await autoGroup(bridge, r.tabId)
+      }
       return r
     },
   },
@@ -1119,12 +1172,17 @@ const TOOL_SPECS = [
         double: { type: 'boolean', description: '双击' },
         snapshot: { type: 'boolean', description: '点击后是否返回新快照，默认 true' },
       },
-      required: [],
+      required: ['tabId'],
       additionalProperties: false,
     },
     async run(args, bridge) {
       if (!args.ref && (args.x == null || args.y == null)) {
         return fail(E.badArgs, '需要 ref，或者同时给 x 和 y')
+      }
+      // 用 ref 就要确认快照还新鲜 —— 否则可能在已导航的页面上点错位置
+      if (args.ref) {
+        const stale = checkSnapshotFresh(args.tabId, bridge) || await verifySnapshotUrl(args.tabId, bridge)
+        if (stale) return stale
       }
       const r = await bridge.request('tab.click', {
         tabId: args.tabId,
@@ -1152,10 +1210,14 @@ const TOOL_SPECS = [
         submit: { type: 'boolean', description: '输入后按回车提交，默认 false' },
         snapshot: { type: 'boolean', description: '提交后是否返回新快照，默认与 submit 一致' },
       },
-      required: ['ref', 'text'],
+      required: ['tabId', 'ref', 'text'],
       additionalProperties: false,
     },
     async run(args, bridge) {
+      if (args.ref) {
+        const stale = checkSnapshotFresh(args.tabId, bridge) || await verifySnapshotUrl(args.tabId, bridge)
+        if (stale) return stale
+      }
       const r = await bridge.request('tab.type', {
         tabId: args.tabId,
         ref: args.ref,
@@ -1180,7 +1242,7 @@ const TOOL_SPECS = [
         ref: { type: 'string', description: '发给哪个元素（省略=当前焦点）' },
         snapshot: { type: 'boolean', description: '按键后是否附带快照，默认 false' },
       },
-      required: ['key'],
+      required: ['tabId', 'key'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1206,7 +1268,7 @@ const TOOL_SPECS = [
         ref: { type: 'string', description: 'mode=to 时要滚到的元素 ref' },
         snapshot: { type: 'boolean', description: '滚完是否附带快照，默认 false' },
       },
-      required: [],
+      required: ['tabId'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1232,7 +1294,7 @@ actions 每项：{ op: 'click'|'type'|'key'|'scroll'|'wait'|'navigate'|'snapshot
         maxElements: { type: 'number', description: '最后快照的元素上限，默认 80' },
         continueOnError: { type: 'boolean', description: '出错后继续，默认 false' },
       },
-      required: ['actions'],
+      required: ['tabId', 'actions'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1255,7 +1317,7 @@ actions 每项：{ op: 'click'|'type'|'key'|'scroll'|'wait'|'navigate'|'snapshot
         tabId: { type: 'number', description: '标签页 id' },
         expr: { type: 'string', description: 'JS 表达式或语句，支持 await。例：location.href 或 document.title' },
       },
-      required: ['expr'],
+      required: ['tabId', 'expr'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1280,7 +1342,7 @@ actions 每项：{ op: 'click'|'type'|'key'|'scroll'|'wait'|'navigate'|'snapshot
         toY: { type: 'number', description: '终点视口 Y' },
         steps: { type: 'number', description: '中间移动步数，默认 10（越大越平滑）' },
       },
-      required: [],
+      required: ['tabId'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1306,7 +1368,7 @@ actions 每项：{ op: 'click'|'type'|'key'|'scroll'|'wait'|'navigate'|'snapshot
         deltaX: { type: 'number', description: '横向滚动量（wheel）' },
         deltaY: { type: 'number', description: '纵向滚动量（wheel，负=向上）' },
       },
-      required: ['x', 'y'],
+      required: ['tabId', 'x', 'y'],
       additionalProperties: false,
     },
     async run(args, bridge) {
@@ -1461,7 +1523,7 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         quality: { type: 'number', description: 'jpeg 质量 1-100，默认 80' },
         keepForeground: { type: 'boolean', description: 'CDP 截图失败时是否允许把标签页切到前台再截。默认 false（不抢焦点）' },
       },
-      required: [],
+      required: ['tabId'],
       additionalProperties: false,
     },
     async run(args, bridge, ctx) {
@@ -1903,4 +1965,9 @@ export function apply(ctx, config = {}) {
   }
 }
 
-export const _internals = { Bridge, parseDataUrl, attachImage, TOOL_SPECS, E }
+export const _internals = {
+  Bridge, parseDataUrl, attachImage, TOOL_SPECS, E,
+  // 安全闸的内部函数，供 test/safety.mjs 验证
+  rememberSnapshot, checkSnapshotFresh, verifySnapshotUrl,
+  snapshotsForTest: () => snapshots,
+}
