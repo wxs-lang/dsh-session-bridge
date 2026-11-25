@@ -177,6 +177,30 @@ try {
             Warn '    $env:HTTPS_PROXY = "http://127.0.0.1:7890"'
         }
     }
+
+    # ── 同步到 node_modules 副本 ──
+    # DSH 通过 name: 做模块解析，优先级 node_modules/ > vendor/。
+    # 不同步会导致「改了代码不生效」，这是最常见的坑。
+    $nmCopy = Join-Path $profileDir 'node_modules\dsh-session-bridge'
+    if (Test-Path $nmCopy) {
+        try {
+            foreach ($f in @('impl.js', 'index.js', 'package.json', 'doctor.mjs')) {
+                $src = Join-Path $target $f
+                if (Test-Path $src) { Copy-Item $src (Join-Path $nmCopy $f) -Force }
+            }
+            $extSrc = Join-Path $target 'extension'
+            $extDst = Join-Path $nmCopy 'extension'
+            if (Test-Path $extSrc) {
+                if (Test-Path $extDst) { Remove-Item $extDst -Recurse -Force }
+                Copy-Item $extSrc $extDst -Recurse -Force
+            }
+            Ok '已同步到 node_modules 副本'
+        } catch {
+            Warn "副本同步失败：$($_.Exception.Message)"
+        }
+    } else {
+        Ok '无 node_modules 副本（不需要同步）'
+    }
 } finally {
     Pop-Location
 }

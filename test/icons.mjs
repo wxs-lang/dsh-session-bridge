@@ -72,13 +72,25 @@ ok(idx.includes("name: 'browser_theme'"), '插件暴露 browser_theme 工具')
 ok(idx.includes("bridge.request('theme.icon'"), 'browser_theme 转发到 theme.icon')
 
 
-// --- 7) 权限（对齐 ChatGPT 1.26 的 19 项） ---
-const WANT = ['alarms','bookmarks','contextMenus','cookies','debugger','downloads','favicon',
-  'history','nativeMessaging','notifications','offscreen','scripting','sessions','sidePanel',
-  'storage','tabGroups','tabs','topSites','webNavigation']
-const missing = WANT.filter((x) => !mf.permissions.includes(x))
-ok(missing.length === 0, `权限齐全（${WANT.length} 项）`, missing.length ? '缺: ' + missing.join(',') : 'all present')
-ok(mf.permissions.length >= 19, '权限数量 >= 19', String(mf.permissions.length))
+// --- 7) 权限（收敛后：只保留代码真正调用的） ---
+// 之前申请 19 项，其中 11 项代码从没调用过 —— 用户装的时候 Chrome 会
+// 列出「读取浏览历史、书签、Cookie、下载记录」，直接影响安装意愿。
+const WANT = ['alarms', 'contextMenus', 'debugger', 'nativeMessaging',
+              'scripting', 'sidePanel', 'tabGroups', 'tabs']
+const UNUSED = ['bookmarks', 'cookies', 'downloads', 'favicon', 'history',
+                'notifications', 'offscreen', 'sessions', 'storage',
+                'topSites', 'webNavigation']
+
+const missing = WANT.filter((p) => !mf.permissions.includes(p))
+ok(missing.length === 0, `核心权限齐全（${WANT.length} 项）`,
+   missing.length ? '缺: ' + missing.join(',') : 'all present')
+
+const stillThere = UNUSED.filter((p) => mf.permissions.includes(p))
+ok(stillThere.length === 0, '未使用的权限已移除',
+   stillThere.length ? '仍在: ' + stillThere.join(',') : 'clean')
+
+ok(mf.permissions.length <= 10, '权限数量已收敛',
+   String(mf.permissions.length) + ' 项（原 19 项）')
 ok(Array.isArray(mf.optional_permissions) && mf.optional_permissions.length > 0, '有 optional_permissions', (mf.optional_permissions || []).join(','))
 ok(mf.side_panel && mf.side_panel.default_path === 'sidepanel.html', 'side_panel 已声明')
 

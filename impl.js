@@ -1514,6 +1514,7 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
     description: `给标签页截图并作为图片回传（模型能直接看到）。看页面布局、验证点击结果、读图表/验证码时用。
 
 **默认在后台截图，不切换标签页、不动你的焦点**（走 CDP Page.captureScreenshot）。
+需要整页（含滚动区外内容）时传 fullPage=true —— 会临时放大视口再截一次，同样不抢焦点。
 只有 CDP 不可用时才会考察 keepForeground：false（默认）时宁可报 capture_unavailable 也不切前台。${WHEN}`,
     parameters: {
       type: 'object',
@@ -1522,6 +1523,16 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         format: { type: 'string', enum: ['png', 'jpeg'], description: '图片格式，默认 png' },
         quality: { type: 'number', description: 'jpeg 质量 1-100，默认 80' },
         keepForeground: { type: 'boolean', description: 'CDP 截图失败时是否允许把标签页切到前台再截。默认 false（不抢焦点）' },
+        fullPage: {
+          type: 'boolean',
+          description: '整页截图（含滚动区外内容）。默认 false 只截可视区。'
+            + '原理：临时把视口设成整页高度再截一次，不拼接、不需要额外依赖。'
+            + '超长页面会自动降 scale 以适应 Chrome 的纹理上限（约 16000px）。',
+        },
+        maxHeight: {
+          type: 'number',
+          description: '整页截图的高度上限（CSS px），默认 16000。超出的部分截断，返回里会标 truncated',
+        },
       },
       required: ['tabId'],
       additionalProperties: false,
@@ -1532,7 +1543,9 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         format: args.format === 'jpeg' ? 'jpeg' : 'png',
         quality: clampInt(args.quality, 80, 1, 100),
         keepForeground: args.keepForeground === true,
-      }, { timeoutMs: 30000 })
+        fullPage: args.fullPage === true,
+        maxHeight: clampInt(args.maxHeight, 16000, 1000, 16000),
+      }, { timeoutMs: 60000 })
       if (!r.ok) return r
       await autoGroup(bridge, r.tabId ?? args.tabId)
       return attachImage(ctx, r)

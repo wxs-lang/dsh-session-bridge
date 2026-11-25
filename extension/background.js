@@ -24,8 +24,15 @@ const BRIDGE_PORTS = [39401, 39411, 39421]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.3.4'
-const RECONNECT_MS = 2000
+const EXT_VERSION = '2.4.0'
+const RECONNECT_MS = 2000          // 首次重连间隔
+const RECONNECT_MAX_MS = 30000     // 退避上限
+const RECONNECT_BACKOFF = 2        // 每次失败乘这个系数
+
+// 冷启动兜底：chrome.tabs.create 偶发返回没有 id 的对象
+// （实测约 20% 概率，出现在刚装扩展、SW 冷启动后的第一批调用里）
+const CREATE_RETRY_COUNT = 3
+const CREATE_RETRY_MS = 120
 const PING_MS = 20000
 // MV3 的 Service Worker 被浏览器卸载后，WS 会一起断，而插件侧无法主动唤醒扩展。
 // 用 alarm 定期把 SW 叫醒重连，保证 DSH 随时能连上（代价是 SW 每分钟醒一次）。
@@ -66,13 +73,23 @@ function link(port) {
   return l
 }
 
+/**
+ * 断线重连，带指数退避。
+ *
+ * 固定 2 秒重试在桥没起来时会每秒打一次日志、烧 CPU；
+ * 退避到 30 秒上限既能快速恢复，又不会在长时间断开时刷屏。
+ * 连上之后 attempt 归零（见 sock.onopen）。
+ */
 function scheduleReconnect(port) {
   const l = link(port)
   if (l.reconnectTimer) return
+  const attempt = Number(l.reconnectAttempt) || 0
+  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_MS * Math.pow(RECONNECT_BACKOFF, attempt))
+  l.reconnectAttempt = attempt + 1
   l.reconnectTimer = setTimeout(() => {
     l.reconnectTimer = null
     connect(port)
-  }, RECONNECT_MS)
+  }, delay)
 }
 
 async function connect(port) {
@@ -97,6 +114,7 @@ async function connect(port) {
   sock.onopen = async () => {
     l.connectedAt = Date.now()
     l.helloSent = true
+    l.reconnectAttempt = 0   // 连上了，退避归零
     // hello 里声明支持哪些命令：桥侧据此路由（多实例/旧版本混连时不会把命令
     // 发给不支持它的那个实例），也方便一眼看出扩展有没有刷到最新。
     send(l, {
@@ -588,14 +606,46 @@ async function resolveTab(tabId, preferActive = true) {
   return all[0]
 }
 
+/**
+ * 判断这个标签能不能注入脚本，不能的话给出**具体的**错误码。
+ *
+ * 之前所有情况都报 restricted_page，调用方无法区分"浏览器限制"和"可以换条路"。
+ * 细分之后：
+ *   restricted_store   → 商店页，任何扩展都动不了，只能换页面
+ *   restricted_pdf     → 内置 PDF 阅读器，可以试着下载原文件
+ *   restricted_extension → 扩展页面，同上
+ *   restricted_page    → 其他浏览器内部页
+ */
 function assertInjectable(tab) {
   const url = tab.url || tab.pendingUrl || ''
-  if (/^(chrome|edge|about|devtools|view-source|chrome-extension|chrome-untrusted|qqbrowser):/i.test(url)) {
-    throw bridgeError('restricted_page', `此页面不允许脚本注入：${url.slice(0, 120)}`)
+
+  if (/^(chrome-extension|moz-extension|safari-web-extension):/i.test(url)) {
+    throw bridgeError('restricted_extension',
+      `扩展页面不允许脚本注入：${url.slice(0, 120)}。换一个普通网页标签再试。`)
   }
-  const blocked = ['chrome.google.com/webstore', 'chromewebstore.google.com', 'microsoftedge.microsoft.com/addons']
+
+  const blocked = ['chrome.google.com/webstore', 'chromewebstore.google.com',
+                   'microsoftedge.microsoft.com/addons', 'addons.mozilla.org']
   if (blocked.some((b) => url.includes(b))) {
-    throw bridgeError('restricted_page', `扩展商店页面不允许脚本注入：${url.slice(0, 120)}`)
+    throw bridgeError('restricted_store',
+      `扩展商店页面不允许脚本注入：${url.slice(0, 120)}。这是浏览器强制限制，任何扩展都绕不过。`)
+  }
+
+  // 内置 PDF 阅读器：chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/
+  if (/\.pdf($|\?)/i.test(url) || url.includes('mhjfbmdgcfjbbpaeojofohoefgiehjai')) {
+    throw bridgeError('restricted_pdf',
+      `内置 PDF 阅读器不允许脚本注入：${url.slice(0, 120)}。`
+      + '要读内容可以先下载原文件，或在浏览器设置里关掉「在浏览器中打开 PDF」。')
+  }
+
+  if (/^(chrome|edge|about|devtools|view-source|chrome-untrusted|qqbrowser|brave):/i.test(url)) {
+    throw bridgeError('restricted_page',
+      `浏览器内部页不允许脚本注入：${url.slice(0, 120)}。换一个普通网页标签再试。`)
+  }
+
+  if (!url) {
+    throw bridgeError('restricted_page',
+      '这个标签还没有 URL（可能是空白页或正在加载）。等页面加载完再试。')
   }
 }
 
@@ -1022,6 +1072,11 @@ function pageSnapshot(opts) {
     return {
       title: document.title || '',
       url: location.href,
+      // 页面总高：调用方据此判断"视口下方还有多少没取"
+      docHeight: Math.max(
+        document.documentElement.scrollHeight || 0,
+        document.body ? document.body.scrollHeight : 0,
+      ),
       costMs: { total: Date.now() - t0, text: textCost, candidates: candidates.length, kept: nodes.length },
       scroll: { x: Math.round(window.scrollX || 0), y: Math.round(window.scrollY || 0) },
       viewport: { w: window.innerWidth || 0, h: window.innerHeight || 0 },
@@ -1472,13 +1527,32 @@ async function cmdTabSnapshot(params) {
     selector: params.selector || null,
     text: params.text === true,
   })
+  // ── 视口覆盖情况 ──
+  // 快照只取当前视口附近。长页面/虚拟滚动列表里靠后的元素取不到，
+  // 调用方需要知道"还有多少没看到"，否则会以为页面就这么多东西。
+  const scroll = r.scroll || { x: 0, y: 0 }
+  const viewport = r.viewport || { w: 0, h: 0 }
+  const docH = Number(r.docHeight) || 0
+  const coveredBottom = scroll.y + viewport.h
+  const uncoveredBelow = docH > 0 ? Math.max(0, docH - coveredBottom) : null
+
   return {
     ok: true,
     tabId: tab.id,
     title: r.title,
     url: r.url,
-    scroll: r.scroll,
-    viewport: r.viewport,
+    scroll,
+    viewport,
+    docHeight: docH || null,
+    // 视口下方还有多少像素没覆盖（null = 拿不到页面总高）
+    uncoveredBelow,
+    coveredRange: docH > 0 ? { from: scroll.y, to: Math.min(coveredBottom, docH) } : null,
+    // 明确告诉调用方怎么拿到下面的内容
+    hint: uncoveredBelow && uncoveredBelow > 50
+      ? `当前视口只覆盖到 ${Math.round(coveredBottom)}px，页面总高 ${docH}px，`
+        + `下方还有 ${Math.round(uncoveredBelow)}px 未取。`
+        + '用 browser_scroll({ mode: "by", pixels: N }) 往下滚再取快照。'
+      : null,
     elementCount: r.elementCount,
     truncated: r.truncated,
     elements: r.elements,
@@ -1835,6 +1909,7 @@ async function cmdTabBatch(params) {
 
   const results = []
   const t0 = Date.now()
+  let aborted = null   // { index, op, reason, code }
 
   for (let i = 0; i < actions.length; i++) {
     const a = actions[i] || {}
@@ -1873,23 +1948,43 @@ async function cmdTabBatch(params) {
       }
       results.push({ index: i, op, ok: true, costMs: Date.now() - started, result: r })
     } catch (e) {
+      const msg = String((e && e.message) || e)
+      // 导航会让页面 JS 上下文销毁，注入类动作会报这几类错
+      const navLike = /context|destroyed|detached|frame|navigation|Cannot access|no tab with id/i.test(msg)
+      const code = navLike ? 'navigation_interrupted' : ((e && e.code) || 'action_failed')
+
       results.push({
         index: i, op, ok: false, costMs: Date.now() - started,
-        error: { code: (e && e.code) || 'action_failed', message: String((e && e.message) || e) },
+        error: { code, message: msg },
       })
+
       // 默认遇错即停（fail-fast），除非显式 continueOnError
-      if (params.continueOnError !== true) break
+      if (params.continueOnError !== true) {
+        aborted = { index: i, op, code, reason: msg.slice(0, 200) }
+        break
+      }
     }
   }
 
   // 最后统一取一次快照（批量最大的收益点）
+  const remaining = actions.length - results.length
   const out = {
     ok: results.every((x) => x.ok),
     tabId: tab.id,
     actionCount: actions.length,
     executed: results.length,
+    // 明确告诉调用方还有几个没跑 —— 之前只能靠 actionCount - executed 自己算
+    remaining,
+    aborted,
     costMs: Date.now() - t0,
     results,
+  }
+  if (aborted) {
+    out.hint = aborted.code === 'navigation_interrupted'
+      ? `第 ${aborted.index} 个动作（${aborted.op}）触发了页面导航，`
+        + `后续 ${remaining} 个动作未执行。请重新取快照确认新页面状态后再继续。`
+      : `第 ${aborted.index} 个动作（${aborted.op}）失败，`
+        + `后续 ${remaining} 个动作未执行。`
   }
   if (params.snapshot !== false) {
     try {
@@ -1993,11 +2088,105 @@ async function cmdTabMouse(params) {
   throw bridgeError('bad_args', `不支持的 action: ${action}（可用 move/wheel）`)
 }
 
+/**
+ * 整页截图：分块取，再拼。
+ *
+ * 为什么分块：Page.captureScreenshot 的 captureBeyondViewport 在超长页面上
+ * 会一次渲染整页，几万像素高的页面直接爆内存或超时。
+ * 分块每次只渲染视口高度的一块，最后用 canvas 拼。
+ *
+ * 前提：需要 CDP（chrome.debugger），不能用 captureVisibleTab。
+ */
+async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
+  const target = { tabId }
+  let attached = false
+  let overridden = false
+  try {
+    await chrome.debugger.attach(target, '1.3')
+    attached = true
+
+    // 1) 页面真实尺寸
+    const m1 = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics')
+    const css = m1.cssContentSize || m1.contentSize
+    const fullW = Math.ceil(css.width)
+    const rawH = Math.ceil(css.height)
+    if (!fullW || !rawH) throw bridgeError('capture_failed', '拿不到页面尺寸')
+
+    const vp = m1.cssLayoutViewport || m1.layoutViewport
+    const vpW = Math.ceil(vp.clientWidth) || 1280
+    const vpH = Math.ceil(vp.clientHeight) || 800
+
+    // 2) 超长页面降 scale（Chrome 纹理上限 ~16384px）
+    const targetH = Math.min(rawH, maxHeight)
+    const scale = Math.min(1, 16000 / Math.max(targetH, 1))
+    const effW = Math.round(fullW * scale)
+    const effH = Math.round(targetH * scale)
+
+    // 3) 把视口临时设成整页大小
+    await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
+      width: effW,
+      height: effH,
+      deviceScaleFactor: scale,
+      mobile: false,
+    })
+    overridden = true
+    // 给渲染器一点时间按新尺寸重排
+    await new Promise((r) => setTimeout(r, 180))
+
+    // 4) 一次截完
+    const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
+      format: fmt,
+      quality: fmt === 'jpeg' ? quality : undefined,
+      captureBeyondViewport: true,
+      fromSurface: true,
+    })
+    if (!shot || !shot.data) throw bridgeError('capture_failed', 'CDP 没有返回图像数据')
+
+    return {
+      dataUrl: `data:image/${fmt};base64,${shot.data}`,
+      fullWidth: effW,
+      fullHeight: effH,
+      originalWidth: fullW,
+      originalHeight: rawH,
+      scale,
+      truncated: rawH > targetH,
+      viewportWidth: vpW,
+      viewportHeight: vpH,
+    }
+  } finally {
+    if (overridden) {
+      try { await chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride') } catch { /* ignore */ }
+    }
+    if (attached) { try { await chrome.debugger.detach(target) } catch { /* ignore */ } }
+  }
+}
+
 async function cmdTabScreenshot(params) {
   const tab = await resolveTab(params.tabId)
   const fmt = params.format === 'jpeg' ? 'jpeg' : 'png'
   const quality = Math.max(1, Math.min(100, Number(params.quality) || 80))
   const wantActive = params.keepForeground === true   // 默认绝不切前台
+
+  // ── 整页截图：分块取，交给插件侧拼 ──
+  if (params.fullPage === true) {
+    const r = await captureFullPage(tab.id, fmt, quality, Number(params.maxHeight) || 16000)
+    return {
+      ok: true,
+      tabId: tab.id,
+      title: tab.title || '',
+      url: tab.url || '',
+      mode: 'fullpage',
+      dataUrl: r.dataUrl,
+      width: r.fullWidth,
+      height: r.fullHeight,
+      originalWidth: r.originalWidth,
+      originalHeight: r.originalHeight,
+      scale: r.scale,
+      truncated: r.truncated,
+      viewport: { w: r.viewportWidth, h: r.viewportHeight },
+      format: fmt,
+    }
+  }
 
   // ── 首选：CDP Page.captureScreenshot，后台截，完全不碰焦点 ──
   // captureVisibleTab 只有在标签页可见时才有画面，所以它必须先把 tab 切前台 ——

@@ -65,19 +65,146 @@ tabId 全局唯一  →  桥记住每个 tabId 归哪个连接  →  带 tabId �
 
 ---
 
+---
+
+## 安全风险：这个插件持有你浏览器的控制权
+
+**请先读完这一节再安装。**
+
+装上之后，DSH 可以通过这个插件：
+
+- 读取你**任何已登录页面**的内容（网银、邮箱、后台、公司 ERP）
+- 在你正在用的浏览器里**点击、输入、提交表单**
+- 截取页面画面
+- 开关标签、读取标签列表
+
+这不是危言耸听，是这个插件的设计目的。所以边界必须讲清楚：
+
+### 三道防线挡的是"网页"，不是"本地恶意软件"
+
+| 防线 | 挡什么 | 不挡什么 |
+|---|---|---|
+| Origin 校验 | 网页里的 JS 连不上本地桥 | 本机的其他程序 |
+| Host 校验 | DNS rebinding | 同上 |
+| `/rpc` 令牌 | 网页猜不到调试通道 | 能读你用户目录的进程 |
+
+**任何能以你的身份运行进程的程序，都能绕过这三道防线。**
+如果你的机器上已经有恶意软件，这个插件会放大它的能力。
+
+### 只在可信环境用
+
+- ✅ 你自己的个人电脑
+- ✅ 你控制的开发机
+- ⚠️ 公司电脑 —— 先确认 IT 政策
+- ❌ 共享机器、网吧、来路不明的虚拟机
+
+### 不要做的事
+
+- 不要和来路不明的扩展共用同一个浏览器 profile
+- 不要在装了网银/支付插件的 profile 里跑自动化任务
+- 不要把 `com.dsh.session.json` 的 `allowed_origins` 改成 `*`
+- 不要把这个桥暴露到 `0.0.0.0`（代码里硬编码 `127.0.0.1`，别改）
+
+### 权限说明
+
+扩展申请 8 项权限，每一项都有对应功能：
+
+| 权限 | 用来做什么 |
+|---|---|
+| `tabs` | 列出/开关标签，读标题和 URL |
+| `tabGroups` | 自动归组（「大肥鱼」分组） |
+| `debugger` | CDP：后台截图、真实输入、整页截图 |
+| `scripting` | 注入页面脚本：快照、点击、输入 |
+| `nativeMessaging` | 原生宿主保活（解决 SW 休眠断线） |
+| `alarms` | 定时清理过期租约、SW 唤醒 |
+| `contextMenus` | 右键菜单（归组、清理调试会话） |
+| `sidePanel` | 状态面板 |
+
+`host_permissions: <all_urls>` 是必需的 —— 你要操作哪个网站事先不知道。
+
+**早期版本申请了 19 项**（含 `history`、`bookmarks`、`cookies`、`downloads`），
+其中 11 项代码从未调用。2.4.0 起全部移除。
+
+### 令牌文件
+
+原生宿主的握手令牌写在 `<tmpdir>/dsh-session-bridge.token`，
+权限 `0600`（仅当前用户可读）。桥每次启动重新生成。
+文件读不到时宿主传空串、桥放行 —— 这是为了避免权限问题把功能弄坏，
+代价是这种情况下少一道校验。
+
+---
+
 ## 安装
 
-### 一、装插件
+### 推荐：一键脚本
 
-```bash
-# 放进 DSH profile 的 vendor 目录
-#   Windows : %USERPROFILE%\.dsh\profiles\desktop\vendor\
-#   macOS/Linux : ~/.dsh/profiles/desktop/vendor/
-cp -r dsh-session-bridge "$DSH_HOME/profiles/desktop/vendor/"
+**Windows**
+
+```powershell
+cd dsh-session-bridge
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 ```
 
-把仓库里的 `cordis.patch.yml` **合并**进
-`$DSH_HOME/profiles/desktop/cordis.patch.yml`：
+**macOS / Linux**
+
+```bash
+cd dsh-session-bridge
+chmod +x install.sh && ./install.sh
+```
+
+脚本会自动完成：
+
+| 步骤 | 做什么 |
+|---|---|
+| 1 | 检查 Node 版本、DSH profile 是否存在 |
+| 2 | 复制插件到 `vendor/`，同步到 `node_modules/` 副本 |
+| 3 | 装 `ws` 依赖（按 `.npmrc` → 官方源 → 国内镜像 依次试） |
+| 4 | 生成并注册 native messaging 宿主（自动检测已装扩展的 ID） |
+| 5 | 打印扩展加载步骤 |
+| 6 | 可选追加 `cordis.patch.yml` |
+| 7 | **跑 `doctor.mjs` 自检** |
+
+### 装完自检
+
+```bash
+node doctor.mjs          # 人类可读
+node doctor.mjs --json   # 机器可读
+```
+
+检查 9 项，失败项直接给修复命令：
+
+```
+dsh-session-bridge 自检
+========================================================
+  ✓ Node 版本        v24.18.0
+  ✓ ws 模块          可解析
+  ✓ 插件文件          5 个齐全
+  ✓ 版本一致          2.4.0
+  ✓ DSH 配置         已登记 dsh-session-bridge
+  ✓ 桥端口            39401 在监听
+  ✓ 扩展连接          2 个连接，版本 2.4.0
+  ✓ 代码新鲜度         已是最新
+  ✓ 副本同步          vendor 与 node_modules 一致
+========================================================
+  9 通过 / 0 警告 / 0 失败
+```
+
+### 手动安装
+
+<details>
+<summary>展开看逐步操作</summary>
+
+**1. 复制插件**
+
+```bash
+cp -r dsh-session-bridge "$DSH_HOME/profiles/desktop/vendor/"
+cd "$DSH_HOME/profiles/desktop/vendor/dsh-session-bridge" && npm install ws
+```
+
+**2. 合并挂载片段**
+
+把 `cordis.patch.yml` 里的 `- insert:` 块追加到
+`$DSH_HOME/profiles/desktop/cordis.patch.yml` 末尾（保持 0 缩进）：
 
 ```yaml
 - insert:
@@ -87,10 +214,14 @@ cp -r dsh-session-bridge "$DSH_HOME/profiles/desktop/vendor/"
       config: {}
 ```
 
-它是**顶层 insert**，对所有会话生效（不是只对某个 preset 生效）。
-合并时保持 0 缩进；如果目标文件本身就是列表，按它已有的风格接上去即可。
+它是**顶层 insert**，对所有会话生效。
 
-重启 DSH 一次。之后改插件代码就不必再重启了——调一次 `browser_reload` 即可热重载。
+**3. 重启 DSH**
+
+改插件代码后不用重启，调 `browser_reload` 即可热重载
+（但改 `index.js` 入口层仍需完整重启）。
+
+</details>
 
 ### 二、装扩展
 
@@ -310,26 +441,76 @@ browser_navigate({ url: "...", browser: "qqbrowser" })  // 只动 QQ浏览器
 
 ---
 
+---
+
+## 错误码参考
+
+所有失败都返回 `{ ok: false, error: <code>, message }`，不抛异常。
+按 code 判断该重试、换页面、还是检查环境：
+
+| code | 含义 | 怎么办 |
+|---|---|---|
+| `extension_disconnected` | 扩展没连上桥 | `browser_status` 看连接数；点扩展图标唤醒 |
+| `timeout` | 命令超时 | 页面可能卡住；先 `browser_snapshot` 探状态 |
+| `tab_not_found` | 标签不存在或已关闭 | 重新 `browser_tabs` 拿 id |
+| `restricted_page` | 浏览器内部页（`chrome://` 等） | 换普通网页标签 |
+| `restricted_store` | 扩展商店页面 | 换页面，任何扩展都动不了 |
+| `restricted_pdf` | 内置 PDF 阅读器 | 先下载原文件 |
+| `restricted_extension` | 扩展页面 | 换页面 |
+| `stale_ref` | ref 在当前页面找不到 | 重新 `browser_snapshot` |
+| `stale_snapshot` | 快照超过 10 分钟或页面已变 | 重新 `browser_snapshot` |
+| `debugger_busy` | 调试器被 DevTools 或其他扩展占用 | 关掉 DevTools 再试 |
+| `debugger_failed` | CDP attach 失败 | 看 message；常见是标签已被回收 |
+| `capture_unavailable` | 后台截不到（CDP 失败且未授权切前台） | 传 `keepForeground: true` 或先切到该标签 |
+| `capture_failed` | 截图过程中失败 | 重试；整页截图可降 `maxHeight` |
+| `navigation_interrupted` | 批量动作触发导航，上下文销毁 | 重新取快照，从剩余动作继续 |
+| `no_history` | 没有可后退/前进的历史条目 | 同文档换 query 不产生历史，属正常 |
+| `inject_failed` | 注入脚本失败 | 页面可能刚导航；重试 |
+| `eval_failed` | `browser_eval` 的表达式抛错 | 看 message 里的 JS 错误 |
+| `bad_args` | 参数不合法 | 看 message |
+| `create_failed` | 开新标签失败（拿不到 tabId） | 重试；已内置 3 次兜底 |
+
+### 批量动作的中断上报
+
+`browser_batch` 遇到导航或错误会停下来，并**明确告诉你还剩几个没跑**：
+
+```json
+{
+  "ok": false,
+  "actionCount": 10,
+  "executed": 4,
+  "remaining": 6,
+  "aborted": { "index": 3, "op": "click", "code": "navigation_interrupted", "reason": "..." },
+  "hint": "第 3 个动作（click）触发了页面导航，后续 6 个动作未执行。请重新取快照确认新页面状态后再继续。"
+}
+```
+
+---
+
 ## 已知边界
 
 写在这里，省得你踩到了以为是它没做好：
 
-| 限制 | 说明 |
-|---|---|
-| 只支持 Chromium 系 | Chrome / Edge / Brave / QQ浏览器 / 360。Firefox 不适用 |
-| `chrome://` 页面动不了 | 浏览器内部页禁止脚本注入 |
-| 快照只覆盖当前视口附近 | 虚拟滚动列表（如 Gmail）里靠后的元素取不到，得先滚动 |
-| 超大页面文本会截断 | 超过 8 万字符的页面改用 `textContent` 粗略提取，不是精确可见文本 |
-| 截图只含可视区 | 没有整页滚动拼接 |
-| 扩展冷启动首批调用偶发失败 | `tab.navigate` 极低概率拿不到 tabId，扩展侧有兜底重查，测试侧带重试 |
-| `dom` 模式的事件不被信任 | `isTrusted === false`，防自动化站点会忽略。这类站点必须用 `mode: "cdp"` |
-| `cdp` 模式有调试横幅 | `chrome.debugger.attach` 期间页面顶部会显示"XX 正在调试此浏览器"，detach 后消失 |
-| `cdp` 模式会被其他调试器挡住 | DevTools 或另一个扩展正在调试该标签时 attach 失败，返回 `debugger_busy` |
-| 系统级快捷键仍做不到 | `Ctrl+W` / `Ctrl+T` 这类浏览器级快捷键走页面事件无效，需要 CDP `Input.dispatchKeyEvent` 且要浏览器接受 |
-| `browser_eval` 依赖 CDP | 目标标签被别的调试器占用时会 attach 失败；`chrome://` 页不可用 |
-| `back` / `forward` 需要真实历史条目 | `chrome.tabs.update` 跳到同一文档内不同 query **不产生历史**，会报 `no_history` |
-| 批量里 `navigate` 会中断后续动作 | 整页跳转会销毁脚本上下文，`browser_batch` 遇到导航会提前结束 |
-| 需要 DSH | 这是 DSH 插件，不是独立 CLI |
+按类型分，一眼看出「能不能做」：
+
+| 限制 | 类型 | 说明 |
+|---|---|---|
+| 只支持 Chromium 系 | ❌ 不支持 | Chrome / Edge / Brave / QQ浏览器 / 360。Firefox 不适用 |
+| `chrome://` 等浏览器内部页 | ❌ 不支持 | 报 `restricted_page`。浏览器强制限制，任何扩展都绕不过 |
+| 扩展商店页面 | ❌ 不支持 | 报 `restricted_store`，同上 |
+| 内置 PDF 阅读器 | ❌ 不支持 | 报 `restricted_pdf`。可先下载原文件，或关掉「在浏览器中打开 PDF」 |
+| 系统级快捷键（`Ctrl+W` / `Ctrl+T`） | ❌ 不支持 | 浏览器级快捷键不走页面事件 |
+| 虚拟滚动列表的靠后元素 | ⚠️ 需滚动 | 快照返回 `uncoveredBelow` 和提示，按提示 `browser_scroll` 再取 |
+| 超大页面文本 | ⚠️ 会截断 | 超 8 万字符改用 `textContent` 粗略提取 |
+| `dom` 模式的事件不被信任 | ⚠️ 需切 CDP | `isTrusted === false`，防自动化站点会忽略。用 `mode: "cdp"` |
+| `cdp` 模式有调试横幅 | ⚠️ 有痕迹 | attach 期间页面顶部显示"正在调试"，detach 后消失 |
+| `cdp` 模式会被其他调试器挡住 | ⚠️ 需关闭冲突 | DevTools 或另一个扩展占用时返回 `debugger_busy` |
+| `browser_eval` 依赖 CDP | ⚠️ 同上 | 调试器被占时 attach 失败 |
+| `back` / `forward` 需要真实历史 | ⚠️ 有限制 | 同文档内换 query **不产生历史**，报 `no_history` |
+| 批量里 `navigate` 会中断后续 | ⚠️ 会上报 | 返回 `aborted` + `remaining`，明确告知剩余动作未执行 |
+| 扩展冷启动首批调用偶发失败 | ⚠️ 已兜底 | `tabs.create` 约 20% 概率返回无 id，重试 3 次 |
+| 整页截图 | ✅ 支持 | `fullPage: true`，临时放大视口一次截完，超 16000px 自动降 scale |
+| 需要 DSH | ℹ️ 前提 | 这是 DSH 插件，不是独立 CLI |
 
 ---
 

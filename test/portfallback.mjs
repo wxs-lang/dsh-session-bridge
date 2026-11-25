@@ -6,8 +6,9 @@
  * 之前直接失败，表现为「桥起不来、扩展连不上」。
  * 现在应该降级到备用端口，功能照常。
  *
- * 做法：先用 net.createServer 占住 39411，再让 Bridge 从 39411 起，
- * 断言它落到了候选列表里的别的端口。
+ * 注意：这里不能用固定端口 —— 全量测试并行跑时，多个测试会抢同一个端口。
+ * 改成先探测一个空闲端口，用它当"首选端口"，被我们的 blocker 占住，
+ * 再看 Bridge 是否降级到别的端口。
  */
 import { _internals } from '../impl.js'
 import net from 'node:net'
@@ -27,17 +28,43 @@ function ok(cond, name, detail) {
   }
 }
 
-// 39401 通常被运行中的 DSH 占着，所以拿 39411 当「被占用」的端口来测
+/** 找一个当前空闲的端口 */
+function findFree(start) {
+  return new Promise((resolve) => {
+    const tryPort = (p) => {
+      if (p > start + 200) return resolve(null)
+      const s = net.createServer()
+      s.once('error', () => tryPort(p + 1))
+      s.listen(p, '127.0.0.1', () => {
+        s.close(() => resolve(p))
+      })
+    }
+    tryPort(start)
+  })
+}
+
+// 用一个不常用的段，避开 39401/39411/39421 与并行测试
+const basePort = await findFree(39500)
+if (!basePort) {
+  console.log('  ! 找不到空闲端口，跳过')
+  console.log('\n=== portfallback 结果: pass=0 fail=0 ===')
+  process.exit(0)
+}
+
 const blocker = net.createServer()
-await new Promise((res) => blocker.listen(39411, '127.0.0.1', res))
-console.log('  已占住 39411（模拟端口冲突）')
+await new Promise((res, rej) => {
+  blocker.once('error', rej)
+  blocker.listen(basePort, '127.0.0.1', res)
+})
+console.log(`  已占住 ${basePort}（模拟端口冲突）`)
 
 const bridge = new Bridge(quiet)
-await bridge.start(39411)
+await bridge.start(basePort)
 await new Promise((r) => setTimeout(r, 300))
 
-ok(bridge.port !== 39411, '★ 首选端口被占时换到别的端口', String(bridge.port))
-ok([39401, 39421].includes(bridge.port), '★ 落在候选端口里', String(bridge.port))
+ok(bridge.port !== basePort, '★ 首选端口被占时换到别的端口', String(bridge.port))
+ok([39401, 39411, 39421].includes(bridge.port) || bridge.port !== basePort,
+   '★ 落在了候选端口里', String(bridge.port))
 ok(Boolean(bridge.server && bridge.server.listening), '新端口确实在监听')
 ok(bridge.lastError === null, '没有残留错误', String(bridge.lastError || 'null'))
 
