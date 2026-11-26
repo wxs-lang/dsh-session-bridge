@@ -24,7 +24,7 @@ const BRIDGE_PORTS = [39401, 39411, 39421]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.4.1'
+const EXT_VERSION = '2.5.0'
 const RECONNECT_MS = 2000          // 首次重连间隔
 const RECONNECT_MAX_MS = 30000     // 退避上限
 const RECONNECT_BACKOFF = 2        // 每次失败乘这个系数

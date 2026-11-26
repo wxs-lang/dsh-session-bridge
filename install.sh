@@ -256,8 +256,28 @@ YAML
   fi
 fi
 
-# ── 6. 自检 ──────────────────────────────────────────────────────────
-step 6 '自检'
+# ── 6. 静默调试提示 ──────────────────────────────────────────────────
+step 6 '配置静默调试（去掉"已开始调试此浏览器"提示）'
+
+cd "$TARGET"
+case "$(uname -s)" in
+  Darwin)
+    # macOS 的 .app 没有 .lnk，需要改 Info.plist 或用启动脚本
+    warn 'macOS 需手动配置，见 README「去掉调试提示」一节'
+    ;;
+  Linux)
+    # Linux 桌面快捷方式在 ~/.local/share/applications/*.desktop
+    if command -v node >/dev/null 2>&1; then
+      node silent-debugger.mjs 2>/dev/null || warn '配置失败（不影响插件功能）'
+    fi
+    ;;
+  *)
+    warn '未知平台，跳过'
+    ;;
+esac
+
+# ── 7. 自检 ──────────────────────────────────────────────────────────
+step 7 '自检'
 
 cd "$TARGET"
 node doctor.mjs || true

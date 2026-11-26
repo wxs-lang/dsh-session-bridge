@@ -22,7 +22,51 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { WebSocket } = require('ws')
 
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.DSH_BRIDGE_PORT || 39401)
+
+/* ── 静默调试提示 ──
+ *
+ * chrome.debugger.attach() 会让浏览器弹「XX 已开始调试此浏览器」，
+ * 扩展 API 无法隐藏，只能靠浏览器启动参数 --silent-debugger-extension-api。
+ *
+ * 扩展没法给自己所在的浏览器加参数，所以由宿主代劳：
+ * 首次运行时给所有浏览器快捷方式补上这个开关。
+ *
+ * 只在标记文件不存在时跑一次，之后跳过（PowerShell 调用有开销）。
+ */
+async function ensureSilentDebugger() {
+  try {
+    const { existsSync } = require('node:fs')
+    const { join } = require('node:path')
+    const { tmpdir } = require('node:os')
+    const flag = join(tmpdir(), 'dsh-session-bridge-silent-debugger.done')
+    if (existsSync(flag)) return
+
+    const { spawn } = require('node:child_process')
+    const script = join(__dirname, 'silent-debugger.mjs')
+    if (!existsSync(script)) return
+
+    // 不阻塞协议通道：spawn 后立刻返回，让它自己跑
+    const child = spawn(process.execPath, [script], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    child.unref()
+
+    // 给脚本一点时间，然后写标记
+    setTimeout(() => {
+      try { require('node:fs').writeFileSync(flag, new Date().toISOString()) } catch { /* ignore */ }
+    }, 8000)
+  } catch { /* 任何失败都不影响主流程 */ }
+}
+
+ensureSilentDebugger()
+
 
 /* ── 桥的握手令牌 ──
  *
@@ -154,6 +198,24 @@ function wsConnect() {
         shutdown()
         return
       }
+      // ── 宿主本地命令 ──
+      // 有些事扩展做不了（要 Node / PowerShell / 文件系统），
+      // 由宿主直接处理，不走扩展。
+      if (msg.cmd === 'host.fix-silent-debugger') {
+        runSilentDebugger(msg)
+        return
+      }
+      if (msg.cmd === 'host.info') {
+        replyToBridge(msg.id, {
+          ok: true,
+          platform: process.platform,
+          node: process.version,
+          pid: process.pid,
+          scriptDir: __dirname,
+        })
+        return
+      }
+
       if (msg.id != null && msg.cmd) {
         writeNative({ type: 'cmd', id: msg.id, cmd: msg.cmd, params: msg.params || {}, timeoutMs: msg.timeoutMs })
       }
@@ -167,6 +229,67 @@ function wsConnect() {
   })
 
   ws.on('error', () => { try { ws.close() } catch { /* ignore */ } })
+}
+
+/** 把结果按 { type: 'result', id, ... } 回给桥。 */
+function replyToBridge(id, payload) {
+  try {
+    ws.send(JSON.stringify({ type: 'result', id, ...payload }))
+  } catch (e) {
+    log('回传结果失败: ' + ((e && e.message) || e))
+  }
+}
+
+/**
+ * 跑 silent-debugger.mjs，把输出回给桥。
+ *
+ * 为什么由宿主做：改快捷方式需要 WScript.Shell COM，
+ * 扩展的 service worker 没有这个能力，只有 Node 能调 PowerShell。
+ */
+function runSilentDebugger(msg) {
+  const { spawn } = require('node:child_process')
+  const { join } = require('node:path')
+  const script = join(__dirname, 'silent-debugger.mjs')
+  const { existsSync } = require('node:fs')
+
+  if (!existsSync(script)) {
+    replyToBridge(msg.id, { ok: false, error: 'script_missing', message: '找不到 silent-debugger.mjs' })
+    return
+  }
+
+  const extra = []
+  if (msg.params && msg.params.dryRun === true) extra.push('--dry-run')
+  if (msg.params && msg.params.restore === true) extra.push('--restore')
+  if (msg.params && msg.params.userShortcuts === true) extra.push('--create-user-shortcuts')
+
+  log('执行 silent-debugger.mjs ' + extra.join(' '))
+  const child = spawn(process.execPath, [script, ...extra], {
+    cwd: __dirname,
+    windowsHide: true,
+  })
+
+  let out = ''
+  let err = ''
+  child.stdout.on('data', (d) => { out += d.toString() })
+  child.stderr.on('data', (d) => { err += d.toString() })
+
+  const timer = setTimeout(() => {
+    try { child.kill() } catch { /* ignore */ }
+  }, 60000)
+
+  child.on('close', (code) => {
+    clearTimeout(timer)
+    replyToBridge(msg.id, {
+      ok: code === 0,
+      exitCode: code,
+      output: out.slice(-4000),
+      stderr: err.slice(-1500),
+    })
+  })
+  child.on('error', (e) => {
+    clearTimeout(timer)
+    replyToBridge(msg.id, { ok: false, error: 'spawn_failed', message: String((e && e.message) || e) })
+  })
 }
 
 function scheduleWsReconnect() {

@@ -1,10 +1,24 @@
 @echo off
-rem dsh-session-native.cmd — native messaging 启动器
+rem dsh-session-native.cmd - native messaging launcher
 rem
-rem Chrome 要求 native host 的 "path" 指向一个**可执行文件**，
-rem 不能直接指向 .mjs。这个 cmd 负责带上 node 运行脚本。
+rem Chrome requires the native host "path" to be an EXECUTABLE,
+rem it cannot point at a .mjs directly. This .cmd runs it with node.
 rem
-rem 注意：native messaging 的 stdio 是二进制协议通道，
-rem 这里绝不能有任何 echo / 输出，否则会破坏协议。
+rem IMPORTANT: native messaging stdio is a binary protocol channel.
+rem Never echo anything here or the protocol breaks.
+rem
+rem NOTE: keep this file ASCII-only. cmd.exe reads it with the system
+rem code page (GBK on zh-CN Windows); non-ASCII comments become
+rem garbage commands and print errors to stderr.
 
-node "%~dp0native-host.mjs"
+setlocal
+set "HERE=%~dp0"
+
+rem Prefer an explicit node if the installer recorded one.
+if exist "%HERE%node-path.txt" (
+  set /p NODE_BIN=<"%HERE%node-path.txt"
+)
+
+if not defined NODE_BIN set "NODE_BIN=node"
+
+"%NODE_BIN%" "%HERE%native-host.mjs"

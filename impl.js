@@ -757,6 +757,44 @@ class Bridge {
    *  3. 否则用 sticky primary：一旦选定就固定，只有它断了才换
    *  4. 所有候选都必须声明支持该命令
    */
+  /**
+   * 把命令发给原生宿主（不是扩展）。
+   *
+   * 有些事只有宿主能做：改快捷方式需要 WScript.Shell COM，
+   * 扩展的 service worker 没这个能力，只有 Node 能调 PowerShell。
+   *
+   * 不走 _send —— 它的 socketFor 会优先选真实浏览器，而我们要的恰恰是宿主。
+   */
+  requestHost(cmd, params, timeoutMs = 70000) {
+    const hosts = [...this.sockets].filter(
+      (s) => s.readyState === 1 && String(s.dshBrand || '') === 'NativeHost'
+    )
+    if (hosts.length === 0) {
+      return Promise.resolve(fail('native_host_missing',
+        '没有原生宿主连接。这个功能需要 native messaging 宿主（install 脚本会装）。'
+        + '装上后重启浏览器即可。'))
+    }
+    const sock = hosts[0]
+    const id = ++this.seq
+    return new Promise((resolveP) => {
+      // 和 _send 保持完全一致的 pending 结构与消息格式，
+      // 这样 onData 的响应处理不需要区分来源。
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          resolveP(fail(E.timeout, `宿主命令 ${cmd} 超过 ${timeoutMs}ms 没响应`))
+        }
+      }, timeoutMs + 500)
+      this.pending.set(id, { resolve: resolveP, timer, sock, cmd })
+      try {
+        sock.send(JSON.stringify({ id, cmd, params: params || {}, timeoutMs }) + '\n')
+      } catch (e) {
+        this.pending.delete(id)
+        clearTimeout(timer)
+        resolveP(fail(E.disconnected, `发送给宿主失败：${(e && e.message) || e}`))
+      }
+    })
+  }
+
   socketFor(cmd, brand, connId, skip) {
     const all = [...this.sockets].filter((s) => s.readyState === 1 && s.dshHelloAt && s !== skip)
     // 优先真实浏览器；中继通道（NativeHost）只做兜底 ——
@@ -1587,6 +1625,59 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
   },
 
   /* ── 标签分组：把操作过的页面归到「大肥鱼」组 ───────────────────── */
+
+  {
+    name: 'browser_fix_debugger_banner',
+    description: `去掉浏览器的「XX 已开始调试此浏览器」提示。
+
+那条提示是 Chrome 对 chrome.debugger.attach() 的强制提示，扩展 API 无法隐藏。
+唯一的出口是浏览器启动参数 --silent-debugger-extension-api，
+需要改快捷方式（桌面 / 开始菜单 / 任务栏）。
+
+这个工具让原生宿主代劳：它在你本机以用户权限跑，能调 PowerShell 改 .lnk。
+
+**改完需要完全退出浏览器再启动**，参数只在启动时读一次。
+
+dryRun 可以只看会改什么不动手。${WHEN}`,
+    parameters: {
+      type: 'object',
+      properties: {
+        dryRun: { type: 'boolean', description: '只看会改哪些快捷方式，不实际修改' },
+        restore: { type: 'boolean', description: '还原成原来的参数（用上次的备份）' },
+        userShortcuts: {
+          type: 'boolean',
+          description: '权限不足时，在用户桌面/开始菜单建带开关的副本（不需要管理员）',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    async run(args, bridge) {
+      const r = await bridge.requestHost('host.fix-silent-debugger', {
+        dryRun: args.dryRun === true,
+        restore: args.restore === true,
+        userShortcuts: args.userShortcuts === true,
+      }, 70000)
+
+      if (!r || !r.ok) {
+        return {
+          ok: false,
+          error: (r && r.error) || 'fix_failed',
+          message: (r && r.message) || '修复失败',
+          output: r && r.output,
+          stderr: r && r.stderr,
+        }
+      }
+      return {
+        ok: true,
+        exitCode: r.exitCode,
+        output: r.output || '',
+        hint: args.dryRun === true
+          ? '这是 dry-run，没有实际修改。去掉 dryRun 再执行一次。'
+          : '已修改快捷方式。请完全退出浏览器（所有窗口），再从快捷方式重新启动。',
+      }
+    },
+  },
 
   {
     name: 'browser_group_ensure',

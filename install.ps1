@@ -348,15 +348,39 @@ if (Test-Path $cordis) {
     }
 }
 
-# ── 6. 完成 ────────────────────────────────────────────────────────────
-Step 6 '完成'
+# ── 6. 静默调试提示 ────────────────────────────────────────────────────
+Step 6 '配置静默调试（去掉"已开始调试此浏览器"提示）'
+
+Push-Location $target
+try {
+    node silent-debugger.mjs
+} catch {
+    Warn '配置失败（不影响插件功能，只是仍会显示调试提示）'
+} finally {
+    Pop-Location
+}
+
+# ── 7. 自检 ────────────────────────────────────────────────────────────
+Step 7 '自检'
+
+Push-Location $target
+try {
+    node doctor.mjs
+} catch {
+    Warn '自检脚本没跑起来（不影响已完成的安装）'
+} finally {
+    Pop-Location
+}
+
+# ── 8. 完成 ────────────────────────────────────────────────────────────
+Step 8 '完成'
 
 Write-Host ''
 Write-Host '    下一步：' -ForegroundColor White
 Write-Host '      1. 完全退出 DSH，再从快捷方式重新启动'
 Write-Host '      2. 在 DSH 里说：browser_status'
 Write-Host ''
-Write-Host '    期望：extensions >= 1，extensionVersion 2.3.0，codeFresh.stale: false' -ForegroundColor DarkGray
+Write-Host '    期望：extensions >= 1，extensionVersion 2.4.1，codeFresh.stale: false' -ForegroundColor DarkGray
 Write-Host ''
 Write-Host '    卡住了看 TROUBLESHOOTING.md。' -ForegroundColor DarkGray
 Write-Host ''
