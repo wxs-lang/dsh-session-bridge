@@ -24,7 +24,7 @@ const BRIDGE_PORTS = [39401, 39411, 39421]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.4.0'
+const EXT_VERSION = '2.4.1'
 const RECONNECT_MS = 2000          // 首次重连间隔
 const RECONNECT_MAX_MS = 30000     // 退避上限
 const RECONNECT_BACKOFF = 2        // 每次失败乘这个系数
@@ -699,10 +699,11 @@ async function withDebugger(tabId, fn) {
     // Input.* domain 必须先 enable，否则 dispatchKeyEvent 会被静默丢弃
     try { await chrome.debugger.sendCommand(target, 'Runtime.enable') } catch { /* ignore */ }
     try { await chrome.debugger.sendCommand(target, 'Page.enable') } catch { /* ignore */ }
-    // 让后台标签也认为自己是"有焦点"的，否则输入事件会被节流掉
-    try {
-      await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
-    } catch { /* 老版本没有 */ }
+    // 这里原本调 Emulation.setFocusEmulationEnabled，让后台标签以为自己是"有焦点"的。
+    // 但它的副作用比收益大：会触发 :focus-within 样式、影响懒加载和
+    // IntersectionObserver，用户能看到布局微调。
+    // 而 Input.dispatchMouseEvent / dispatchKeyEvent 直接进合成器，不等 rAF，
+    // 根本不需要它。所以去掉。
   } catch (e) {
     const m = String((e && e.message) || e)
     // 已经有别的调试器（另一个扩展 / DevTools）挂着
@@ -2089,18 +2090,21 @@ async function cmdTabMouse(params) {
 }
 
 /**
- * 整页截图：分块取，再拼。
+ * 整页截图：用 clip 指定区域，**不改视口**。
  *
- * 为什么分块：Page.captureScreenshot 的 captureBeyondViewport 在超长页面上
- * 会一次渲染整页，几万像素高的页面直接爆内存或超时。
- * 分块每次只渲染视口高度的一块，最后用 canvas 拼。
+ * 历史：早先用 Emulation.setDeviceMetricsOverride 把视口临时设成整页高度，
+ * 再截一次、再清掉。问题是这样会让页面按新尺寸重排两次（设一次、清一次），
+ * 肉眼能看到明显跳动 —— 用户正在看这个标签时会很难受。
  *
- * 前提：需要 CDP（chrome.debugger），不能用 captureVisibleTab。
+ * 现在改成 Page.captureScreenshot 的 clip + captureBeyondViewport：
+ * 渲染器在不改变视口的前提下按 clip 区域渲染一帧。页面布局完全不动。
+ *
+ * 超长页面处理：Chrome 单帧纹理上限约 16384px，超过就降 scale。
+ * 再超过 maxHeight 就截断，返回里标 truncated。
  */
 async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
   const target = { tabId }
   let attached = false
-  let overridden = false
   try {
     await chrome.debugger.attach(target, '1.3')
     attached = true
@@ -2116,47 +2120,41 @@ async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
     const vpW = Math.ceil(vp.clientWidth) || 1280
     const vpH = Math.ceil(vp.clientHeight) || 800
 
-    // 2) 超长页面降 scale（Chrome 纹理上限 ~16384px）
+    // 2) 决定截取高度与缩放
     const targetH = Math.min(rawH, maxHeight)
+    // 纹理上限 16384，留一点余量
     const scale = Math.min(1, 16000 / Math.max(targetH, 1))
-    const effW = Math.round(fullW * scale)
-    const effH = Math.round(targetH * scale)
 
-    // 3) 把视口临时设成整页大小
-    await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
-      width: effW,
-      height: effH,
-      deviceScaleFactor: scale,
-      mobile: false,
-    })
-    overridden = true
-    // 给渲染器一点时间按新尺寸重排
-    await new Promise((r) => setTimeout(r, 180))
-
-    // 4) 一次截完
+    // 3) 直接按 clip 截，不动视口
     const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
       format: fmt,
       quality: fmt === 'jpeg' ? quality : undefined,
-      captureBeyondViewport: true,
+      clip: {
+        x: 0,
+        y: 0,
+        width: fullW,
+        height: targetH,
+        scale,
+      },
+      captureBeyondViewport: true,   // 允许渲染视口外区域
       fromSurface: true,
     })
     if (!shot || !shot.data) throw bridgeError('capture_failed', 'CDP 没有返回图像数据')
 
     return {
       dataUrl: `data:image/${fmt};base64,${shot.data}`,
-      fullWidth: effW,
-      fullHeight: effH,
+      fullWidth: Math.round(fullW * scale),
+      fullHeight: Math.round(targetH * scale),
       originalWidth: fullW,
       originalHeight: rawH,
       scale,
       truncated: rawH > targetH,
       viewportWidth: vpW,
       viewportHeight: vpH,
+      // 标记：这版不再改视口，页面不会重排
+      layoutUntouched: true,
     }
   } finally {
-    if (overridden) {
-      try { await chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride') } catch { /* ignore */ }
-    }
     if (attached) { try { await chrome.debugger.detach(target) } catch { /* ignore */ } }
   }
 }
@@ -2199,10 +2197,8 @@ async function cmdTabScreenshot(params) {
   try {
     await chrome.debugger.attach(target, '1.3')
     try {
-      // 确保渲染器不因后台节流而停帧
-      try {
-        await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
-      } catch { /* 老版本可能没有，忽略 */ }
+      // 同上：不调 setFocusEmulationEnabled。
+      // Page.captureScreenshot 不依赖 rAF，不需要伪造焦点。
       const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
         format: fmt,
         quality: fmt === 'jpeg' ? quality : undefined,

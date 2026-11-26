@@ -44,9 +44,19 @@ console.log('\n──── ① 整页截图 ────')
   ok(String(shot.description).includes('整页'), '描述里说明整页截图')
 
   ok(BG.includes('captureFullPage'), '扩展侧有 captureFullPage')
-  ok(BG.includes('setDeviceMetricsOverride'), '用视口放大实现（不依赖图像库）')
-  ok(BG.includes('clearDeviceMetricsOverride'), '截完恢复视口')
   ok(BG.includes('16000'), '有纹理上限保护')
+
+  // ── 关键：整页截图不能改视口，否则页面会重排两次（肉眼可见的跳动）──
+  const code = BG.replace(/\/\*[\s\S]*?\*\//g, '')   // 去掉注释再判断
+  ok(!/Emulation\.setDeviceMetricsOverride\s*,?\s*\{/.test(code)
+     && !/sendCommand\([^)]*'Emulation\.setDeviceMetricsOverride'/.test(code),
+     '★ 不再调 setDeviceMetricsOverride（页面不重排）')
+  ok(!/sendCommand\([^)]*'Emulation\.clearDeviceMetricsOverride'/.test(code),
+     '★ 不再调 clearDeviceMetricsOverride')
+  ok(!/sendCommand\([^)]*'Emulation\.setFocusEmulationEnabled'/.test(code),
+     '★ 不再伪造焦点（避免 :focus-within 等副作用）')
+  ok(BG.includes('captureBeyondViewport'), '用 captureBeyondViewport 截视口外')
+  ok(BG.includes('clip:'), '用 clip 指定截取区域')
 }
 
 // ── ② 快照视口提示 ──
