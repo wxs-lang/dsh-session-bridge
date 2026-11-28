@@ -469,6 +469,12 @@ browser_navigate({ url: "...", browser: "qqbrowser" })  // 只动 QQ浏览器
 | `eval_failed` | `browser_eval` 的表达式抛错 | 看 message 里的 JS 错误 |
 | `bad_args` | 参数不合法 | 看 message |
 | `create_failed` | 开新标签失败（拿不到 tabId） | 重试；已内置 3 次兜底 |
+| `cdp_failed` | CDP 命令执行失败 | 重试；持续失败就换 DOM 模式 |
+| `native_host_missing` | 没装原生宿主 | 重跑 install 脚本 |
+| `no_tab` | 标签不存在（旧写法） | 同 `tab_not_found` |
+| `unknown_command` | 扩展不认这条命令 | 扩展版本太旧，`chrome://extensions` 刷新 |
+| `extension_error` | 扩展内部错误 | 看 message |
+| `attachments_unavailable` | DSH 附件服务不可用 | 重启 DSH |
 
 ### 批量动作的中断上报
 

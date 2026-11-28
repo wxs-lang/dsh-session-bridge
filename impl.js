@@ -139,7 +139,15 @@ class Bridge {
     this.hello = null              // { version, browser, at }
     this.seq = 0
     this.pending = new Map()       // id -> { resolve, reject, timer }
-    this.queue = Promise.resolve() // 串行化链
+    /* 串行化队列，按连接分片。
+     *
+     * 为什么不分片不行：全局一条链时，浏览器 A 正在跑 15 秒的页面加载，
+     * 发往浏览器 B 的 browser_tabs 也会排在后面 —— 明明互不相干。
+     *
+     * 分片键的优先级：connId > brand > '__default__'。
+     * 同一片内严格串行（防同一浏览器上的竞态），跨片并行。
+     */
+    this.queues = new Map()
     this.port = DEFAULT_PORT
     this.startedAt = 0
     this.lastError = null
@@ -737,8 +745,20 @@ class Bridge {
       }
       return retry
     }
-    const p = this.queue.then(run, run)
-    this.queue = p.then(() => undefined, () => undefined)
+    // ── 按连接分片排队 ──
+    const lane = String(
+      opts.connId !== undefined && opts.connId !== null ? opts.connId
+        : (opts.brand ? `brand:${String(opts.brand).toLowerCase()}` : '__default__')
+    )
+    const prev = this.queues.get(lane) || Promise.resolve()
+    const p = prev.then(run, run)
+    // 链尾只保留"完成信号"，不保留结果，避免内存堆积
+    const tail = p.then(() => undefined, () => undefined)
+    this.queues.set(lane, tail)
+    // 链走完就清掉这一片的记录，Map 不会无限增长
+    tail.then(() => {
+      if (this.queues.get(lane) === tail) this.queues.delete(lane)
+    })
     return p
   }
 
@@ -1552,7 +1572,11 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
     description: `给标签页截图并作为图片回传（模型能直接看到）。看页面布局、验证点击结果、读图表/验证码时用。
 
 **默认在后台截图，不切换标签页、不动你的焦点**（走 CDP Page.captureScreenshot）。
-需要整页（含滚动区外内容）时传 fullPage=true —— 会临时放大视口再截一次，同样不抢焦点。
+需要整页（含滚动区外内容）时传 fullPage=true —— 用 clip 区域截，不改视口、页面不重排。
+
+**默认格式是 JPEG（quality 80）**：PNG 的 Base64 体积是 JPEG 的 3~5 倍，走 stdio + WebSocket
+转发慢，回传模型更会吃光上下文。确实需要无损时显式传 format='png'。
+返回里带 bytes / kb 字段，可据此判断要不要降 maxWidth。
 只有 CDP 不可用时才会考察 keepForeground：false（默认）时宁可报 capture_unavailable 也不切前台。${WHEN}`,
     parameters: {
       type: 'object',
@@ -1571,6 +1595,11 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
           type: 'number',
           description: '整页截图的高度上限（CSS px），默认 16000。超出的部分截断，返回里会标 truncated',
         },
+        maxWidth: {
+          type: 'number',
+          description: '整页截图的宽度上限（CSS px），默认 1280。控制 Base64 体积——'
+            + '超宽页面按比例缩到该宽度，避免一张图几 MB 拖慢转发、吃光上下文。',
+        },
       },
       required: ['tabId'],
       additionalProperties: false,
@@ -1583,6 +1612,7 @@ action: list（列全部连接）/ close（关掉一个 connId）/ drop-native�
         keepForeground: args.keepForeground === true,
         fullPage: args.fullPage === true,
         maxHeight: clampInt(args.maxHeight, 16000, 1000, 16000),
+        maxWidth: clampInt(args.maxWidth, 1280, 320, 4096),
       }, { timeoutMs: 60000 })
       if (!r.ok) return r
       await autoGroup(bridge, r.tabId ?? args.tabId)

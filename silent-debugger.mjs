@@ -22,13 +22,24 @@
  *   node silent-debugger.mjs --restore  # 还原
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const BACKUP = join(HERE, '.silent-debugger-backup.json')
+/* 备份写到用户数据目录，不放代码目录。
+ *
+ * 原因：备份里含本机快捷方式绝对路径（带用户名）。
+ * 放在仓库根目录会被 git 追踪、弄脏工作区，还有把
+ * 本机路径推到公开仓库的风险。
+ */
+const DATA_DIR = join(os.homedir(), '.dsh-session-bridge')
+const BACKUP = join(DATA_DIR, 'silent-debugger-backup.json')
+
+function ensureDataDir() {
+  try { mkdirSync(DATA_DIR, { recursive: true }) } catch { /* ignore */ }
+}
 const SWITCH = '--silent-debugger-extension-api'
 
 const args = process.argv.slice(2)
@@ -177,6 +188,7 @@ function main() {
     switch: SWITCH,
     records: need.map((s) => ({ path: s.Path, target: s.Target, originalArgs: String(s.Arguments || '') })),
   }
+  ensureDataDir()
   writeFileSync(BACKUP, JSON.stringify(bak, null, 2), 'utf8')
   console.log(`\n已备份原参数到 ${BACKUP}`)
 

@@ -24,7 +24,7 @@ const BRIDGE_PORTS = [39401, 39411, 39421]
  *  改这里并刷新扩展即可；想看 QQ浏览器 就把它加进来。 */
 const ALLOWED_BRANDS = ['Chrome', 'Edge', 'Unknown']
 
-const EXT_VERSION = '2.5.0'
+const EXT_VERSION = '2.6.0'
 const RECONNECT_MS = 2000          // 首次重连间隔
 const RECONNECT_MAX_MS = 30000     // 退避上限
 const RECONNECT_BACKOFF = 2        // 每次失败乘这个系数
@@ -689,37 +689,137 @@ async function inject(tabId, func, args) {
  * 而且会独占该 tab 的调试会话（用完必须 detach）。
  */
 
-/** 在 tab 上跑一段需要 debugger 的操作，确保 detach。 */
+/* ── debugger 会话租约 ──────────────────────────────────────────────
+ *
+ * 为什么需要：连续操作同一个表单时（click → type → pressKey），
+ * 每次都 attach/detach 会累积 IPC 开销，而且 attach 期间用户看到
+ * 调试横幅反复闪烁。
+ *
+ * 租约模型：attach 之后不立刻 detach，保留 6 秒。
+ * 期间同 tabId 的操作直接复用；空闲超时或标签关闭才释放。
+ */
+const DBG_LEASE_MS = 6000
+const dbgLeases = new Map()   // tabId -> { attachedAt, timer }
+
+/** 标记某 tab 的调试会话正在使用中，并顺延释放时间。 */
+function touchDbgLease(tabId) {
+  const cur = dbgLeases.get(tabId)
+  if (cur && cur.timer) clearTimeout(cur.timer)
+  const timer = setTimeout(() => releaseDbgLease(tabId), DBG_LEASE_MS)
+  // SW 里 timer 可能被回收，加个兜底：下次访问时按 attachedAt 判断
+  dbgLeases.set(tabId, {
+    attachedAt: cur ? cur.attachedAt : Date.now(),
+    timer,
+  })
+}
+
+/** 释放某 tab 的调试会话。所有失败都静默 —— 释放本身不该影响结果。 */
+async function releaseDbgLease(tabId) {
+  const cur = dbgLeases.get(tabId)
+  if (!cur) return
+  dbgLeases.delete(tabId)
+  if (cur.timer) clearTimeout(cur.timer)
+  try {
+    await chrome.debugger.detach({ tabId })
+  } catch { /* 标签已关闭 / 已被别的调试器接管 —— 都不影响 */ }
+}
+
+/** 释放全部（插件卸载 / 浏览器关闭时）。 */
+async function releaseAllDbgLeases() {
+  for (const tabId of [...dbgLeases.keys()]) {
+    await releaseDbgLease(tabId)
+  }
+}
+
+// 标签关闭 → 立刻释放（避免对已销毁的 tab 调 detach 报错）
+try {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    const cur = dbgLeases.get(tabId)
+    if (cur && cur.timer) clearTimeout(cur.timer)
+    dbgLeases.delete(tabId)
+  })
+} catch { /* ignore */ }
+
+// 调试会话被外部断开（DevTools 打开、用户点取消）→ 清掉本地记录
+try {
+  chrome.debugger.onDetach.addListener((source) => {
+    const tabId = source && source.tabId
+    if (tabId === undefined || tabId === null) return
+    const cur = dbgLeases.get(tabId)
+    if (cur && cur.timer) clearTimeout(cur.timer)
+    dbgLeases.delete(tabId)
+  })
+} catch { /* ignore */ }
+
+/**
+ * 在 tab 上跑一段需要 debugger 的操作。
+ *
+ * 现在带租约：首次 attach 后保留 DBG_LEASE_MS 毫秒，
+ * 期间同 tabId 的后续操作直接复用，不再重复 attach/detach。
+ *
+ * 好处：
+ *   · 连续操作（click → type → key）少 2/3 的 IPC 往返
+ *   · 调试横幅不会反复闪
+ *
+ * 失败一律返回结构化错误，不抛异常。
+ */
 async function withDebugger(tabId, fn) {
-  let attached = false
-  const target = { tabId }   // 和截图路径一致：复用同一个 target 对象
-  try {
-    await chrome.debugger.attach(target, '1.3')
-    attached = true
-    // Input.* domain 必须先 enable，否则 dispatchKeyEvent 会被静默丢弃
-    try { await chrome.debugger.sendCommand(target, 'Runtime.enable') } catch { /* ignore */ }
-    try { await chrome.debugger.sendCommand(target, 'Page.enable') } catch { /* ignore */ }
-    // 这里原本调 Emulation.setFocusEmulationEnabled，让后台标签以为自己是"有焦点"的。
-    // 但它的副作用比收益大：会触发 :focus-within 样式、影响懒加载和
-    // IntersectionObserver，用户能看到布局微调。
-    // 而 Input.dispatchMouseEvent / dispatchKeyEvent 直接进合成器，不等 rAF，
-    // 根本不需要它。所以去掉。
-  } catch (e) {
-    const m = String((e && e.message) || e)
-    // 已经有别的调试器（另一个扩展 / DevTools）挂着
-    if (/Another debugger|already attached|Cannot attach/i.test(m)) {
-      throw bridgeError('debugger_busy', `标签页已被其他调试器占用：${m.slice(0, 200)}`)
+  const target = { tabId }
+  const lease = dbgLeases.get(tabId)
+  let reused = false
+
+  // 复用已有会话（但要确认它还活着）
+  if (lease) {
+    try {
+      await chrome.debugger.sendCommand(target, 'Runtime.enable')
+      reused = true
+    } catch {
+      // 会话已死（标签重建 / 被外部 detach），清掉记录后重连
+      if (lease.timer) clearTimeout(lease.timer)
+      dbgLeases.delete(tabId)
     }
-    throw bridgeError('debugger_failed', `attach 失败：${m.slice(0, 200)}`)
   }
+
+  if (!reused) {
+    try {
+      await chrome.debugger.attach(target, '1.3')
+      // Input.* domain 必须先 enable，否则 dispatchKeyEvent 会被静默丢弃
+      try { await chrome.debugger.sendCommand(target, 'Runtime.enable') } catch { /* ignore */ }
+      try { await chrome.debugger.sendCommand(target, 'Page.enable') } catch { /* ignore */ }
+    } catch (e) {
+      const m = String((e && e.message) || e)
+      if (/Another debugger|already attached|Cannot attach/i.test(m)) {
+        throw bridgeError('debugger_busy', `标签页已被其他调试器占用：${m.slice(0, 200)}`)
+      }
+      // 标签可能在 attach 过程中被销毁
+      if (/No tab with|not found|Invalid tab/i.test(m)) {
+        throw bridgeError('tab_not_found', `标签页 ${tabId} 已不存在：${m.slice(0, 160)}`)
+      }
+      throw bridgeError('debugger_failed', `attach 失败：${m.slice(0, 200)}`)
+    }
+  }
+
+  touchDbgLease(tabId)
+
   try {
-    return await fn((method, params) => chrome.debugger.sendCommand(target, method, params))
+    const r = await fn((method, params) => chrome.debugger.sendCommand(target, method, params))
+    touchDbgLease(tabId)   // 操作成功，顺延释放时间
+    return r
   } catch (e) {
     const m = String((e && e.message) || e)
+    // 标签没了：立刻清租约，别等超时
+    if (/No tab with|not found|Invalid tab/i.test(m)) {
+      const cur = dbgLeases.get(tabId)
+      if (cur && cur.timer) clearTimeout(cur.timer)
+      dbgLeases.delete(tabId)
+      throw bridgeError('tab_not_found', `操作过程中标签页被关闭：${m.slice(0, 160)}`)
+    }
     throw bridgeError('cdp_failed', `CDP 命令失败：${m.slice(0, 200)}`)
-  } finally {
-    if (attached) { try { await chrome.debugger.detach(target) } catch { /* ignore */ } }
   }
+  // 注意：这里**不再** detach。释放交给租约超时或标签关闭事件。
+  // 原来在 finally 里 detach 有两个问题：
+  //   1. 连续操作时反复 attach/detach，开销大、横幅闪烁
+  //   2. click 触发导航导致 tab 销毁时，detach 抛异常可能盖掉正常结果
 }
 
 /** 真实鼠标点击（CDP）。x/y 是视口 CSS 像素坐标。 */
@@ -858,36 +958,96 @@ async function cdpType(tabId, text) {
  *  用 CDP Runtime.evaluate：它能读页面真实变量、调页面自家 API，
  *  且不受 ISOLATED world 的隔离限制。失败时回退到注入式。 */
 async function evaluateInPage(tabId, expr) {
-  // 首选 CDP：能力最全
-  let attached = false
+  // 走 withDebugger，复用租约（连续 eval 不会反复 attach）
   try {
-    await chrome.debugger.attach({ tabId }, '1.3')
-    attached = true
-    const r = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-      expression: expr,
-      returnByValue: true,
-      awaitPromise: true,
-      userGesture: true,
+    return await withDebugger(tabId, async (send) => {
+      const r = await send('Runtime.evaluate', {
+        expression: expr,
+        returnByValue: true,
+        awaitPromise: true,
+        userGesture: true,
+      })
+      if (r && r.exceptionDetails) {
+        const m = r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'eval failed'
+        return { ok: false, error: { code: 'eval_failed', message: String(m).slice(0, 500) }, via: 'cdp' }
+      }
+      const v = r && r.result ? r.result.value : undefined
+      return {
+        ok: true,
+        value: v === undefined ? null : v,
+        type: r && r.result ? r.result.type : 'undefined',
+        via: 'cdp',
+      }
     })
-    if (r && r.exceptionDetails) {
-      const m = r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'eval failed'
-      return { ok: false, error: { code: 'eval_failed', message: String(m).slice(0, 500) } }
-    }
-    const v = r && r.result ? r.result.value : undefined
+  } catch (e) {
     return {
-      ok: true,
-      value: v === undefined ? null : v,
-      type: r && r.result ? r.result.type : 'undefined',
+      ok: false,
+      error: { code: (e && e.code) || 'eval_failed', message: String((e && e.message) || e).slice(0, 500) },
       via: 'cdp',
     }
-  } catch (e) {
-    return { ok: false, error: { code: 'eval_failed', message: String((e && e.message) || e).slice(0, 500) }, via: 'cdp' }
-  } finally {
-    if (attached) { try { await chrome.debugger.detach({ tabId }) } catch { /* ignore */ } }
   }
 }
 
 /* ── 注入脚本（必须自包含，不能引用外部符号）────────────────────────── */
+
+/**
+ * 把 ref 解析成元素，顺带校验它是否还属于当前快照。
+ *
+ * 为什么需要：ref 是页面级临时标记。React/Vue 局部重绘后
+ * 旧节点被销毁、新节点补位，同一个编号会指向完全不同的按钮。
+ * 盲目点下去就是静默误操作 —— 比报错危险得多。
+ *
+ * 返回 { el } 或 { error, message }。
+ */
+function resolveRef(ref) {
+  const raw = String(ref || '').replace(/"/g, '')
+  if (!raw) return { error: 'bad_args', message: 'ref 为空' }
+
+  // 新格式 e4-12：带 epoch
+  const m = /^e(\d+)-(\d+)$/.exec(raw)
+  let selector
+  if (m) {
+    const epoch = Number(m[1])
+    const cur = Number(window.__dshRefEpoch) || 0
+    if (epoch !== cur) {
+      return {
+        error: 'stale_ref',
+        message: `ref=${raw} 属于第 ${epoch} 次快照，当前已是第 ${cur} 次。`
+          + '页面重新渲染过，请重新调用 browser_snapshot 取新 ref。',
+      }
+    }
+    selector = `[data-dsh-ref="${epoch}-${m[2]}"]`
+  } else {
+    // 旧格式 e12（没有 epoch）—— 兼容，但无法校验新旧
+    const legacy = /^e(\d+)$/.exec(raw)
+    if (!legacy) return { error: 'bad_args', message: `ref 格式不对：${raw}（应形如 e4-12）` }
+    const cur = Number(window.__dshRefEpoch) || 0
+    if (cur > 0) {
+      return {
+        error: 'stale_ref',
+        message: `ref=${raw} 是旧格式（没有快照轮次），当前页面已用第 ${cur} 次快照。`
+          + '请重新调用 browser_snapshot。',
+      }
+    }
+    selector = `[data-dsh-ref="${raw.slice(1)}"]`
+  }
+
+  const el = document.querySelector(selector)
+  if (!el) {
+    return {
+      error: 'stale_ref',
+      message: `找不到 ref=${raw} 对应的元素。页面可能已更新，请重新 browser_snapshot。`,
+    }
+  }
+  // 节点还在文档里吗（被 removeChild / 框架卸载后 isConnected 为 false）
+  if (el.isConnected === false) {
+    return {
+      error: 'stale_ref',
+      message: `ref=${raw} 的元素已从页面移除。请重新 browser_snapshot。`,
+    }
+  }
+  return { el }
+}
 
 /** 快照：给可交互元素打 data-dsh-ref，返回元素清单 + 可视文本。 */
 function pageSnapshot(opts) {
@@ -1017,8 +1177,10 @@ function pageSnapshot(opts) {
     }
 
     const elements = nodes.map((el, i) => {
-      const ref = 'e' + (i + 1)
-      try { el.setAttribute('data-dsh-ref', ref) } catch { /* ignore */ }
+      // ref 带 epoch：e4-12 表示"第 4 次快照的第 12 个元素"
+      // 定位时会校验 epoch，页面重绘后旧 ref 会被拒
+      const ref = `e${epoch}-${i + 1}`
+      try { el.setAttribute('data-dsh-ref', `${epoch}-${i + 1}`) } catch { /* ignore */ }
       const rect = el.getBoundingClientRect()
       const role = roleOf(el)
       const name = nameOf(el)
@@ -1099,7 +1261,9 @@ function pageClick(opts) {
     let el = null
     let hit = 'ref'
     if (ref) {
-      el = document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`)
+      const __r_el = resolveRef(ref)
+    if (__r_el.error) return { __error: __r_el.error, __message: __r_el.message }
+    el = __r_el.el
       if (!el) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（页面可能已变化，重新取快照）` }
     } else {
       const x = Number(opts && opts.x)
@@ -1234,7 +1398,9 @@ function pageKey(opts) {
     const ref = opts && opts.ref
     let target = null
     if (ref) {
-      target = document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`)
+      const __r_target = resolveRef(ref)
+    if (__r_target.error) return { __error: __r_target.error, __message: __r_target.message }
+    target = __r_target.el
       if (!target) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（重新取快照）` }
       try { target.focus() } catch { /* ignore */ }
     } else {
@@ -1296,7 +1462,12 @@ function pageScroll(opts) {
     const before = window.scrollY
 
     if (mode === 'to' || ref) {
-      const el = ref ? document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`) : null
+      let el = null
+    if (ref) {
+      const __rr = resolveRef(ref)
+      if (__rr.error) return { __error: __rr.error, __message: __rr.message }
+      el = __rr.el
+    }
       if (!el) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（重新取快照）` }
       try { el.scrollIntoView({ block: (opts && opts.block) || 'center', behavior: 'instant' }) } catch { /* ignore */ }
     } else if (mode === 'top') {
@@ -1337,7 +1508,12 @@ function pageType(opts) {
     const ref = opts && opts.ref
     const text = String((opts && opts.text) == null ? '' : opts.text)
     const clear = opts && opts.clear !== false
-    const el = ref ? document.querySelector(`[data-dsh-ref="${String(ref).replace(/"/g, '')}"]`) : null
+    let el = null
+    if (ref) {
+      const __rr = resolveRef(ref)
+      if (__rr.error) return { __error: __rr.error, __message: __rr.message }
+      el = __rr.el
+    }
     if (!el) return { __error: 'stale_ref', __message: `找不到 ref=${ref} 的元素（重新取快照）` }
 
     try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }) } catch { /* ignore */ }
@@ -1573,7 +1749,9 @@ async function cmdTabClick(params) {
     // 给了 ref 就先算它的视口中心坐标
     if (params.ref) {
       const box = await inject(tab.id, (opts) => {
-        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        const __r_el = resolveRef(opts.ref)
+    if (__r_el.error) return { __error: __r_el.error, __message: __r_el.message }
+    el = __r_el.el
         if (!el) return null
         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
         const r = el.getBoundingClientRect()
@@ -1670,7 +1848,9 @@ async function cmdTabType(params) {
   if (tMode === 'cdp') {
     if (params.ref) {
       await inject(tab.id, (opts) => {
-        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        const __r_el = resolveRef(opts.ref)
+    if (__r_el.error) return { __error: __r_el.error, __message: __r_el.message }
+    el = __r_el.el
         if (el && typeof el.focus === 'function') el.focus()
         // 需要清空就先全选
         if (opts.clear && el && typeof el.select === 'function') { try { el.select() } catch { } }
@@ -1841,7 +2021,9 @@ async function cmdTabKey(params) {
     if (params.ref) {
       // 先把焦点放到目标元素上
       await inject(tab.id, (opts) => {
-        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        const __r_el = resolveRef(opts.ref)
+    if (__r_el.error) return { __error: __r_el.error, __message: __r_el.message }
+    el = __r_el.el
         if (el && typeof el.focus === 'function') el.focus()
         return true
       }, { ref: params.ref }).catch(() => null)
@@ -2047,7 +2229,9 @@ async function cmdTabDrag(params) {
   const resolvePoint = async (ref, x, y) => {
     if (ref) {
       const box = await inject(tab.id, (opts) => {
-        const el = document.querySelector(`[data-dsh-ref="${String(opts.ref).replace(/"/g, '')}"]`)
+        const __r_el = resolveRef(opts.ref)
+    if (__r_el.error) return { __error: __r_el.error, __message: __r_el.message }
+    el = __r_el.el
         if (!el) return null
         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
         const r = el.getBoundingClientRect()
@@ -2102,15 +2286,11 @@ async function cmdTabMouse(params) {
  * 超长页面处理：Chrome 单帧纹理上限约 16384px，超过就降 scale。
  * 再超过 maxHeight 就截断，返回里标 truncated。
  */
-async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
-  const target = { tabId }
-  let attached = false
-  try {
-    await chrome.debugger.attach(target, '1.3')
-    attached = true
-
+async function captureFullPage(tabId, fmt, quality, maxHeight = 16000, maxWidth = 1280) {
+  // 走 withDebugger：复用租约，连续截图不反复 attach
+  return await withDebugger(tabId, async (send) => {
     // 1) 页面真实尺寸
-    const m1 = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics')
+    const m1 = await send('Page.getLayoutMetrics')
     const css = m1.cssContentSize || m1.contentSize
     const fullW = Math.ceil(css.width)
     const rawH = Math.ceil(css.height)
@@ -2122,11 +2302,15 @@ async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
 
     // 2) 决定截取高度与缩放
     const targetH = Math.min(rawH, maxHeight)
-    // 纹理上限 16384，留一点余量
-    const scale = Math.min(1, 16000 / Math.max(targetH, 1))
+    // 两个约束取更严的：
+    //   · 纹理上限 16384（单帧渲染限制）
+    //   · maxWidth（控制 Base64 体积，默认 1280）
+    const byHeight = 16000 / Math.max(targetH, 1)
+    const byWidth = maxWidth / Math.max(fullW, 1)
+    const scale = Math.min(1, byHeight, byWidth)
 
     // 3) 直接按 clip 截，不动视口
-    const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
+    const shot = await send('Page.captureScreenshot', {
       format: fmt,
       quality: fmt === 'jpeg' ? quality : undefined,
       clip: {
@@ -2154,26 +2338,34 @@ async function captureFullPage(tabId, fmt, quality, maxHeight = 16000) {
       // 标记：这版不再改视口，页面不会重排
       layoutUntouched: true,
     }
-  } finally {
-    if (attached) { try { await chrome.debugger.detach(target) } catch { /* ignore */ } }
-  }
+  })
 }
 
 async function cmdTabScreenshot(params) {
   const tab = await resolveTab(params.tabId)
-  const fmt = params.format === 'jpeg' ? 'jpeg' : 'png'
+  // 默认 JPEG：PNG 的 Base64 体积是 JPEG 的 3~5 倍，
+  // 走 stdio + WebSocket 转发慢，回传 LLM 更会吃光上下文。
+  // 显式传 format: 'png' 才用 PNG。
+  const fmt = params.format === 'png' ? 'png' : 'jpeg'
   const quality = Math.max(1, Math.min(100, Number(params.quality) || 80))
   const wantActive = params.keepForeground === true   // 默认绝不切前台
 
   // ── 整页截图：分块取，交给插件侧拼 ──
   if (params.fullPage === true) {
-    const r = await captureFullPage(tab.id, fmt, quality, Number(params.maxHeight) || 16000)
+    const r = await captureFullPage(
+      tab.id, fmt, quality,
+      Number(params.maxHeight) || 16000,
+      Number(params.maxWidth) || 1280,
+    )
+    const fpBytes = Math.round((r.dataUrl.length - r.dataUrl.indexOf(',') - 1) * 0.75)
     return {
       ok: true,
       tabId: tab.id,
       title: tab.title || '',
       url: tab.url || '',
       mode: 'fullpage',
+      bytes: fpBytes,
+      kb: Math.round(fpBytes / 1024),
       dataUrl: r.dataUrl,
       width: r.fullWidth,
       height: r.fullHeight,
@@ -2195,22 +2387,17 @@ async function cmdTabScreenshot(params) {
   const target = { tabId: tab.id }
 
   try {
-    await chrome.debugger.attach(target, '1.3')
-    try {
-      // 同上：不调 setFocusEmulationEnabled。
-      // Page.captureScreenshot 不依赖 rAF，不需要伪造焦点。
-      const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-        format: fmt,
-        quality: fmt === 'jpeg' ? quality : undefined,
-        captureBeyondViewport: false,
-        fromSurface: true,
-      })
-      if (shot && shot.data) {
-        dataUrl = `data:image/${fmt};base64,${shot.data}`
-        method = 'cdp'
-      }
-    } finally {
-      try { await chrome.debugger.detach(target) } catch { /* ignore */ }
+    // 走 withDebugger：复用租约。
+    // 不调 setFocusEmulationEnabled —— Page.captureScreenshot 不依赖 rAF。
+    const shot = await withDebugger(tab.id, async (send) => send('Page.captureScreenshot', {
+      format: fmt,
+      quality: fmt === 'jpeg' ? quality : undefined,
+      captureBeyondViewport: false,
+      fromSurface: true,
+    }))
+    if (shot && shot.data) {
+      dataUrl = `data:image/${fmt};base64,${shot.data}`
+      method = 'cdp'
     }
   } catch (e) {
     cdpErr = e
@@ -2248,9 +2435,13 @@ async function cmdTabScreenshot(params) {
   }
 
   const fresh = await chrome.tabs.get(tab.id)
+  // Base64 体积：调用方据此判断要不要降质/降宽
+  const b64Bytes = dataUrl ? Math.round((dataUrl.length - dataUrl.indexOf(',') - 1) * 0.75) : 0
   return {
     ok: true,
     tabId: tab.id,
+    bytes: b64Bytes,
+    kb: Math.round(b64Bytes / 1024),
     title: fresh.title || '',
     url: fresh.url || '',
     dataUrl,

@@ -32,3 +32,7 @@ com.dsh.bridge.json
 com.dsh.session.json
 package-lock.json
 *.tgz
+
+# 本机专属：快捷方式备份含绝对路径与用户名，绝不入库
+.silent-debugger-backup.json
+.silent-debugger-*.json
